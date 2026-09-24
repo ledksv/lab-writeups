@@ -102,8 +102,6 @@ mmuser:Crack_The_MM_Admin_PW@tcp(127.0.0.1:3306)/mattermost
 
 ### 3.3 MySQL
 
-**Dead end - password as positional arg:** `mysql -u mmuser -p Crack_The_MM_Admin_PW` fails with "Access denied to database 'Crack_The_MM_Admin_PW'" - with a space after `-p`, mysql reads the token as the database name, not the password. Enter the password at the prompt instead.
-
 ```bash
 mysql -u mmuser -p
 # enter Crack_The_MM_Admin_PW at prompt
