@@ -10,6 +10,7 @@ Writeups from labs I have completed across HackTheBox, TryHackMe, and VulnHub. R
 | [DevHub](devhub-htb.md) | HackTheBox | Linux | 2026-09-21 | Locked |
 | [Management](management-htb.md) | HackTheBox | Linux | 2026-09-13 | Locked |
 | [Cohort](cohort-htb.md) | HackTheBox | Linux | 2026-09-13 | Locked |
+| [Delivery](delivery-htb.md) | HackTheBox | Linux | 2026-09-24 | Published |
 | [Sunday](sunday-htb.md) | HackTheBox | Solaris | 2026-09-08 | Published |
 | [Soccer](soccer-htb.md) | HackTheBox | Linux | 2026-09-03 | Published |
 | [SmartHire](smarthire-htb.md) | HackTheBox | Linux | 2026-08-21 | Locked |
