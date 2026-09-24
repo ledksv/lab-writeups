@@ -7,17 +7,6 @@
 
 Three services on the box. The trick is noticing that osTicket hands you a working `@delivery.htb` mailbox when you open a ticket, and Mattermost's email verification lands straight in that ticket thread. From there credentials in an internal chat channel give SSH access, and a bcrypt hash in the Mattermost database cracks in seconds once you know the base word.
 
-## 0. Attack Chain
-
-1. Recon finds SSH (22), nginx (80), and Mattermost 5.30.1 (8065)
-2. Port 80 reveals `helpdesk.delivery.htb` running osTicket. Mattermost only lets you register with an `@delivery.htb` email
-3. Opening an osTicket ticket gives you a `<number>@delivery.htb` address - the Mattermost verification email lands in that ticket thread
-4. Verify the Mattermost account, join the Internal team, read root's posts leaking `maildeliverer:Youve_G0t_Mail!` and a hint about passwords being variants of `PleaseSubscribe!`
-5. SSH in as `maildeliverer` - user flag
-6. Read Mattermost `config.json`, MySQL creds, dump the Users table, root's bcrypt hash
-7. Crack with `john` + `best64` rule seeded with `PleaseSubscribe!` - result: `PleaseSubscribe!21`
-8. `su root` with the cracked password - root flag
-
 ## 1. Enumeration
 
 ```bash
