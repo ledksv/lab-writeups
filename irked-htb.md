@@ -5,7 +5,7 @@
 **Tags:** UnrealIRCd, CVE-2010-2075, IRC Backdoor, Supply Chain, Steghide, Steganography, SUID
 **Date:** 2026-10-06
 
-Three ports running the same IRC daemon is the first hint something is off. UnrealIRCd 3.2.8.1 was a supply-chain compromise -- the official tarball was quietly replaced with a backdoored build that executes anything prefixed with `AB;` via system(). That gets a shell as ircd. A hidden backup file in djmardov's home directory contains a steganography password, which extracts djmardov's SSH password from an image on the web server. From there a custom SUID binary calls system() on a path in world-writable /tmp, which doesn't exist -- so we write it ourselves and root runs it.
+Three ports running the same IRC daemon is the first hint something is off. UnrealIRCd 3.2.8.1 was a supply-chain compromise, the official tarball was quietly replaced with a backdoored build that executes anything prefixed with `AB;` via system(). That gets a shell as ircd. A hidden backup file in djmardov's home directory contains a steganography password, which extracts djmardov's SSH password from an image on the web server. From there a custom SUID binary calls system() on a path in world-writable /tmp that doesn't exist, so we write it ourselves and root runs it.
 
 ## 1. Enumeration
 
