@@ -5,7 +5,7 @@
 **Tags:** MFP Portal, SCF Attack, Responder, NetNTLMv2, Hash Cracking, WinRM, PrintNightmare, CVE-2021-1675
 **Date:** 2026-10-01
 
-Port 80 runs an MFP firmware update portal behind HTTP Basic auth. Uploaded firmware lands on a file share that a local user browses, so instead of going for a web shell I dropped a malicious SCF file that forces Windows Explorer to authenticate to a Responder listener and leaks the NetNTLMv2 hash. The hash cracks straight against rockyou. WinRM is on 5985 so the credentials get a shell immediately. Tony's PowerShell history shows a RICOH printer driver was recently installed and Print Spooler is running as SYSTEM -- that is PrintNightmare. The exploit loads a malicious DLL as SYSTEM, adds a local admin account, and that account reads the root flag directly by path.
+Port 80 runs an MFP firmware update portal behind HTTP Basic auth. Uploaded firmware lands on a file share that a local user browses, so instead of going for a web shell I dropped a malicious SCF file that forces Windows Explorer to authenticate to a Responder listener and leaks the NetNTLMv2 hash. The hash cracks straight against rockyou. WinRM is on 5985 so the credentials get a shell immediately. Tony's PowerShell history shows a RICOH printer driver was recently installed and Print Spooler is running as SYSTEM, that is PrintNightmare. The exploit loads a malicious DLL as SYSTEM, adds a local admin account, and that account reads the root flag directly by path.
 
 ## 1. Enumeration
 
