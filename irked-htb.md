@@ -37,7 +37,7 @@ curl -si http://10.129.79.131/
 <b><center>IRC is almost working!</b></center>
 ```
 
-Just a page pointing at IRC. Grabbed the image and checked it for hidden data -- nothing surfaced at this point. The steg password came up later and made sense of it then.
+Just a page pointing at IRC. Grabbed the image and checked it for hidden data, nothing surfaced at this point. The steg password came up later and made sense of it then.
 
 ```bash
 wget http://10.129.79.131/irked.jpg
@@ -368,4 +368,3 @@ root@irked:/root# cat root.txt
 | High | Delete `/home/djmardov/Documents/.backup` and rotate the SSH password. Remove embedded data from `irked.jpg`. | F-02 |
 
 **Test artefacts:** `/tmp/listusers` was created on the target to exploit the viewuser binary. It should be confirmed removed.
-

