@@ -457,3 +457,4 @@ Evidence blocks are sourced from the [Delivery assessment walkthrough](delivery-
 | E-02 | Walkthrough section 2.2: Mattermost Internal channel credential disclosure and SSH foothold |
 | E-03 | Walkthrough sections 3.2 and 3.4: config.json read and MySQL hash extraction |
 | E-04 | Walkthrough sections 3.5 and 3.6: John rule-based crack and su to root |
+

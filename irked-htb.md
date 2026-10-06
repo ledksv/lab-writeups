@@ -368,3 +368,4 @@ root@irked:/root# cat root.txt
 | High | Delete `/home/djmardov/Documents/.backup` and rotate the SSH password. Remove embedded data from `irked.jpg`. | F-02 |
 
 **Test artefacts:** `/tmp/listusers` was created on the target to exploit the viewuser binary. It should be confirmed removed.
+
