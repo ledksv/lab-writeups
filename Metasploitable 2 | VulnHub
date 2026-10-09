@@ -395,3 +395,4 @@ Evidence blocks are sourced from the [Metasploitable 2 assessment walkthrough](m
 | E-02 | Walkthrough section 2: Samba username map script exploitation |
 | E-03 | Walkthrough section 2: MySQL root default credential access |
 | E-04 | Walkthrough section 2: Telnet default credential access |
+
