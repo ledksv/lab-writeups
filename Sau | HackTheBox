@@ -348,3 +348,4 @@ Evidence blocks are sourced from the [Sau assessment walkthrough](sau-htb.html) 
 | E-01 | Walkthrough section 2: SSRF basket creation and internal service discovery |
 | E-02 | Walkthrough section 3: Maltrail command injection and shell access as puma |
 | E-03 | Walkthrough section 4: sudo systemctl, less pager escape and root shell |
+
