@@ -459,3 +459,4 @@ Evidence blocks are sourced from the [Soccer assessment walkthrough](soccer-htb.
 | E-02 | Walkthrough section 4: PHP upload and shell access |
 | E-03 | Walkthrough section 5: SSH session as player |
 | E-04 | Walkthrough section 6: doas rule, plugin permissions and root identity |
+
