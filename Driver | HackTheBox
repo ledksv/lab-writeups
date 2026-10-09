@@ -410,3 +410,4 @@ powershell -ep bypass -c ". .\CVE-2021-1675.ps1; Invoke-Nightmare -NewUser 'hack
 | High | Restrict write access to the firmware upload share. Block outbound SMB to untrusted destinations. | F-02 |
 
 **Test artefacts:** A `hacker` local admin account was created on the target via Invoke-Nightmare and `CVE-2021-1675.ps1` was uploaded to `C:\Users\tony\Documents`. Both should be confirmed removed.
+
