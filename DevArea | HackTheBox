@@ -501,3 +501,4 @@ Evidence blocks are sourced from the [DevArea assessment walkthrough](devarea-ht
 | E-02 | Walkthrough section 2: Hoverfly service file credential disclosure |
 | E-03 | Walkthrough section 3: CVE-2025-54123 RCE and reverse shell |
 | E-04 | Walkthrough section 4: World-writable bash binary and sudo escalation |
+
