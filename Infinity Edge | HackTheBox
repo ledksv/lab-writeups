@@ -347,3 +347,4 @@ The attack sequence moved from ASPX webshell deployment for initial command exec
 
 This investigation was conducted on a single PCAP artefact. No filesystem image, memory dump, Windows Event Logs or registry hives were available. Conclusions about persistence mechanism, initial delivery vector for the webshell, and extent of data access are therefore assessed rather than confirmed from direct artefacts. A complete investigation would require full disk and memory images from the affected host.
 Evidence blocks are sourced from the [Window's Infinity Edge investigation walkthrough](infinityedge-htb.html) .
+
