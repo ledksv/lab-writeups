@@ -323,3 +323,4 @@ Evidence blocks are sourced from the [CCTV assessment walkthrough](cctv-htb.html
 | --- | --- |
 | E-01 | Walkthrough sections 2 and 3: ZoneMinder SQLi, hash extraction, cracking and SSH access |
 | E-02 | Walkthrough sections 4 and 5: internal port discovery, port forwarding and motionEye RCE |
+
