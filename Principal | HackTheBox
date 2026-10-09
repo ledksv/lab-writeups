@@ -380,3 +380,4 @@ Evidence blocks are sourced from the [Principal assessment walkthrough](principa
 | E-01 | Walkthrough section 2: JWT authentication bypass and admin API access |
 | E-02 | Walkthrough sections 3-4: /api/settings credential exposure and SSH initial access |
 | E-03 | Walkthrough section 5: SSH CA key enumeration and root certificate forgery |
+
