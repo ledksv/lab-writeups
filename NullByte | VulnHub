@@ -329,3 +329,4 @@ Evidence blocks are sourced from the [NullByte assessment walkthrough](nullbyte-
 | E-01 | Walkthrough section 4: SQL injection and hash extraction |
 | E-02 | Walkthrough section 2: Steganographic path disclosure |
 | E-03 | Walkthrough section 6: SUID binary privilege escalation |
+
