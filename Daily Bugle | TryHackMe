@@ -469,3 +469,4 @@ Evidence blocks are sourced from the [Daily Bugle assessment walkthrough](daily-
 | E-02 | Walkthrough section 4: Template PHP injection and apache shell |
 | E-03 | Walkthrough section 5: Configuration file credential reuse and jjameson SSH |
 | E-04 | Walkthrough section 6: sudo yum GTFOBins escalation to root |
+
