@@ -456,3 +456,4 @@ Evidence blocks are sourced from the [Pterodactyl assessment walkthrough](pterod
 | E-01 | Walkthrough section 2: CVE-2025-49132 path traversal and credential recovery |
 | E-02 | Walkthrough section 3: CVE-2025-6018 PAM poisoning and polkit session |
 | E-03 | Walkthrough section 4: CVE-2025-6019 XFS race condition and root shell |
+
