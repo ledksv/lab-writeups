@@ -485,3 +485,4 @@ Evidence blocks are sourced from the [Interpreter assessment walkthrough](interp
 | E-02 | Walkthrough section 3: mirth.properties credential extraction and database enumeration |
 | E-03 | Walkthrough section 4: PBKDF2 hash cracking and SSH access as sedric |
 | E-04 | Walkthrough section 5: notif.py discovery, eval() injection and root shell |
+
