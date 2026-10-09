@@ -313,3 +313,4 @@ Evidence blocks are sourced from the [Wingdata assessment walkthrough](wingdata-
 | --- | --- |
 | E-01 | Walkthrough section 3: WingFTP RCE via CVE-2025-47812 |
 | E-02 | Walkthrough section 4: sudo enumeration, tar crafting and root shell |
+
