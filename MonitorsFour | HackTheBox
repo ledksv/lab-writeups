@@ -442,3 +442,4 @@ Evidence blocks are sourced from the [MonitorsFour assessment walkthrough](monit
 | E-01 | Walkthrough section 2: Credential Discovery - API enumeration and hash recovery |
 | E-02 | Walkthrough section 3: Shell via CVE-2025-24367 Cacti RCE |
 | E-03 | Walkthrough section 4: Container escape via CVE-2025-9074 Docker Engine API |
+
