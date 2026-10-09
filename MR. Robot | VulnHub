@@ -391,3 +391,4 @@ Evidence blocks are sourced from the [MR. Robot assessment walkthrough](mr-robot
 | E-02 | Walkthrough section 3: Theme editor PHP injection and daemon shell |
 | E-03 | Walkthrough section 3: Hash extraction from home directory and su to robot |
 | E-04 | Walkthrough section 4: SUID nmap interactive mode root shell |
+
