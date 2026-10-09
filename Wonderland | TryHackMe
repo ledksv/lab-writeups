@@ -352,3 +352,4 @@ Evidence blocks are sourced from the [Wonderland assessment walkthrough](wonderl
 | E-01 | Walkthrough section 2-3: Web enumeration and credential discovery in page source |
 | E-02 | Walkthrough section 4: Sudo rule exploitation and Python library hijack |
 | E-03 | Walkthrough section 5: SUID binary PATH hijacking and root shell |
+
