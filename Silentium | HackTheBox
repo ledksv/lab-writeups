@@ -440,3 +440,4 @@ Evidence blocks are sourced from the [Silentium assessment walkthrough](silentiu
 | E-02 | Walkthrough section 4: Flowise RCE and Docker shell |
 | E-03 | Walkthrough section 5: container env enumeration and SSH as ben |
 | E-04 | Walkthrough section 6: Gogs discovery, port forwarding and symlink RCE |
+
