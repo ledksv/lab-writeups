@@ -369,3 +369,4 @@ Evidence blocks are sourced from the [Kobold assessment walkthrough](kobold-htb.
 | E-01 | Walkthrough section 2: MCPJam RCE and ben shell |
 | E-02 | Walkthrough section 3: PrivateBin LFI and www-data code execution |
 | E-03 | Walkthrough section 4: Docker group escalation and root shell |
+
