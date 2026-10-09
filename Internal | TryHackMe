@@ -472,3 +472,4 @@ Confirm that repeated failed login attempts trigger a lockout or delay. Verify t
 ### 5.2 Assessment scope and limitations
 
 This assessment was conducted against a TryHackMe laboratory environment. The findings reflect confirmed access paths within the assessed scope. No source-code review was performed and no exhaustive enumeration of all services or configurations is claimed. The assessment does not represent a complete security evaluation of a production deployment.
+
