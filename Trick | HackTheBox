@@ -24,7 +24,7 @@ DNS zone transfer (misconfigured `allow-transfer { any; }`) reveals `preprod-pay
 
 ---
 
-## F-01 — DNS Zone Transfer Unrestricted
+## F-01: DNS Zone Transfer Unrestricted
 
 **Severity:** Medium | **CVSS:** 5.3 (AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
 
@@ -34,7 +34,7 @@ ISC BIND is configured with `allow-transfer { any; };`, allowing any host to req
 
 ---
 
-## F-02 — SQL Injection with FILE Privilege
+## F-02: SQL Injection with FILE Privilege
 
 **Severity:** Critical | **CVSS:** 9.8 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)
 
@@ -47,11 +47,11 @@ curl -s -X POST 'http://preprod-payroll.trick.htb/ajax.php?action=login' \
 sqlmap ... --file-read=/etc/nginx/sites-enabled/default
 ```
 
-**Remediation:** Use prepared statements with parameterised queries throughout. Revoke `FILE` privilege from all application database users. Apply the principle of least privilege — the web application user should only have SELECT/INSERT/UPDATE on the tables it requires.
+**Remediation:** Use prepared statements with parameterised queries throughout. Revoke `FILE` privilege from all application database users. Apply the principle of least privilege: the web application user should only have SELECT/INSERT/UPDATE on the tables it requires.
 
 ---
 
-## F-03 — Non-Recursive LFI Filter Bypass
+## F-03: Non-Recursive LFI Filter Bypass
 
 **Severity:** High | **CVSS:** 8.1 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N)
 
@@ -66,7 +66,7 @@ curl -s 'http://preprod-marketing.trick.htb/index.php?page=....//....//....//hom
 
 ---
 
-## F-04 — fail2ban Group Write + Passwordless Sudo Restart
+## F-04: fail2ban Group Write + Passwordless Sudo Restart
 
 **Severity:** High | **CVSS:** 7.8 (AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H)
 
